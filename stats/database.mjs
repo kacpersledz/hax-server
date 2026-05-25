@@ -1,5 +1,5 @@
 import Database from 'better-sqlite3';
-import { mkdirSync, readdirSync, statSync, copyFileSync, removeSync } from 'fs';
+import { mkdirSync, readdirSync, statSync, copyFileSync } from 'fs';
 import { dirname, join } from 'path';
 
 /**
