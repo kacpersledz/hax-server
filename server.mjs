@@ -3,11 +3,21 @@ import fs from 'fs';
 import url from 'url';
 import path from 'path';
 import { start, stop, getRoomState, setStateUpdateCallback, getStatsTracker } from './haxball.mjs';
+import { StatsDatabase } from './stats/index.mjs';
 
 const PORT = process.env.PORT || 8080;
 
 // Array to hold connected SSE clients
 let clients = [];
+let backupDb = null;
+
+async function getBackupDatabase() {
+    if (!backupDb) {
+        backupDb = new StatsDatabase('./data/stats.db');
+        await backupDb.connect();
+    }
+    return backupDb;
+}
 
 // Function to send the current state to all connected clients
 function sendStateToAllClients() {
@@ -199,12 +209,8 @@ const server = http.createServer(async (req, res) => {
         (async () => {
             try {
                 const statsTracker = getStatsTracker();
-                if (!statsTracker) {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ message: "Stats tracker not initialized. Start the room first." }));
-                    return;
-                }
-                const backups = statsTracker.db.listBackups();
+                const db = statsTracker?.db ?? await getBackupDatabase();
+                const backups = db.listBackups();
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify(backups));
             } catch (error) {
@@ -232,13 +238,8 @@ const server = http.createServer(async (req, res) => {
                 }
 
                 const statsTracker = getStatsTracker();
-                if (!statsTracker) {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ message: "Stats tracker not initialized. Start the room first." }));
-                    return;
-                }
-
-                const result = await statsTracker.db.restoreBackup(filename);
+                const db = statsTracker?.db ?? await getBackupDatabase();
+                const result = await db.restoreBackup(filename);
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ message: result.message, restoredFrom: result.restoredFrom }));
             } catch (error) {
@@ -257,13 +258,8 @@ const server = http.createServer(async (req, res) => {
                 }
 
                 const statsTracker = getStatsTracker();
-                if (!statsTracker) {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ message: "Stats tracker not initialized." }));
-                    return;
-                }
-
-                const backups = statsTracker.db.listBackups();
+                const db = statsTracker?.db ?? await getBackupDatabase();
+                const backups = db.listBackups();
                 const backup = backups.find(b => b.filename === file);
 
                 if (!backup) {
