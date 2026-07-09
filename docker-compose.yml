@@ -2,7 +2,7 @@ version: "3.8" # Specifying a version is good practice
 
 services:
   haxball-server:
-    image: "register.kacpersledz.com/hax-server:0.1.0"
+    image: "register.kacpersledz.com/hax-server/app:0.1.0"
     build:
       context: .
       dockerfile: Dockerfile
