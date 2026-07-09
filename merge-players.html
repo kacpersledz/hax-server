@@ -111,17 +111,30 @@
             resultEl.innerHTML = html;
         }
 
+        async function readJsonResponse(response) {
+            const contentType = response.headers.get('content-type') || '';
+            const body = await response.text();
+            if (!contentType.includes('application/json')) {
+                throw new Error(`Expected JSON response, got ${contentType || 'unknown content type'} with status ${response.status}.`);
+            }
+            try {
+                return JSON.parse(body);
+            } catch (error) {
+                throw new Error(`Invalid JSON response from server: ${error.message}`);
+            }
+        }
+
         async function loadPlayers() {
             try {
                 refreshBtn.disabled = true;
                 refreshBtn.textContent = 'Loading...';
                 const response = await fetch(`${API_BASE_URL}/players`);
+                const data = await readJsonResponse(response);
                 if (!response.ok) {
-                    const data = await response.json();
                     throw new Error(data.message || 'Failed to load players');
                 }
 
-                players = await response.json();
+                players = data;
                 sourceAuthEl.replaceChildren(new Option('Select player...', ''));
                 targetAuthEl.replaceChildren(new Option('Select player...', ''));
                 for (const player of players) {
@@ -169,7 +182,7 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ sourceAuth, targetAuth })
                 });
-                const data = await response.json();
+                const data = await readJsonResponse(response);
                 if (!response.ok) {
                     throw new Error(data.message || 'Failed to merge players');
                 }

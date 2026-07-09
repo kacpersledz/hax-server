@@ -1,6 +1,5 @@
 import http from 'http';
 import fs from 'fs';
-import url from 'url';
 import path from 'path';
 import { start, stop, getRoomState, setStateUpdateCallback, getStatsTracker } from './haxball.mjs';
 import { StatsDatabase } from './stats/index.mjs';
@@ -44,7 +43,7 @@ function sendStateToAllClients() {
 setStateUpdateCallback(sendStateToAllClients);
 
 const server = http.createServer(async (req, res) => {
-    const parsedUrl = url.parse(req.url, true);
+    const parsedUrl = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     const pathname = parsedUrl.pathname;
 
     // Unprotected route for joining the room
@@ -112,7 +111,7 @@ const server = http.createServer(async (req, res) => {
                 res.end(data);
             }
         });
-    } else if (pathname === '/merge-players') {
+    } else if (pathname === '/merge-players' && req.method === 'GET') {
         fs.readFile('merge-players.html', (err, data) => {
             if (err) {
                 res.writeHead(500);
@@ -308,7 +307,7 @@ const server = http.createServer(async (req, res) => {
     } else if (pathname === '/download-backup' && req.method === 'GET') {
         (async () => {
             try {
-                const { file } = parsedUrl.query;
+                const file = parsedUrl.searchParams.get('file');
                 if (!file) {
                     res.writeHead(400, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ message: "Backup filename is required." }));
