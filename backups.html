@@ -24,6 +24,7 @@
         #empty-message { padding: 2em; text-align: center; color: #999; font-style: italic; }
         .nav-links { margin-bottom: 2em; padding-bottom: 1em; border-bottom: 1px solid #ddd; }
         .nav-links a { margin-right: 1em; }
+        #backup-action-status { min-height: 1.5em; }
     </style>
 </head>
 <body>
@@ -41,6 +42,8 @@
 
     <div id="backups-container">
         <h2>Available Backups</h2>
+        <button type="button" id="create-backup-btn">Create backup now</button>
+        <p id="backup-action-status" aria-live="polite"></p>
         <p id="loading-message" class="loading">Loading backups...</p>
         <div id="backups-list"></div>
     </div>
@@ -50,6 +53,8 @@
         const roomWarningEl = document.getElementById('room-warning');
         const backupsListEl = document.getElementById('backups-list');
         const loadingMessageEl = document.getElementById('loading-message');
+        const createBackupBtn = document.getElementById('create-backup-btn');
+        const backupActionStatusEl = document.getElementById('backup-action-status');
         const API_BASE_URL = ''; // Current origin
 
         let roomStatus = 'stopped';
@@ -105,31 +110,48 @@
                 // Sort by timestamp descending (newest first)
                 backups.sort((a, b) => b.timestamp - a.timestamp);
 
-                backupsListEl.innerHTML = backups.map((backup, index) => `
-                    <div class="backup-item">
-                        <div class="backup-info">
-                            <b>Timestamp:</b> ${formatDate(backup.timestamp)}
-                        </div>
-                        <div class="backup-info">
-                            <b>File Size:</b> ${formatFileSize(backup.size)}
-                        </div>
-                        <div class="backup-info">
-                            <b>Filename:</b> <code>${backup.filename}</code>
-                        </div>
-                        <div class="backup-actions">
-                            <a href="${API_BASE_URL}/download-backup?file=${encodeURIComponent(backup.filename)}" download="${backup.filename}">
-                                <button type="button">📥 Download</button>
-                            </a>
-                            <button type="button" data-restore-btn data-file="${backup.filename}" ${roomStatus !== 'stopped' ? 'disabled' : ''}>
-                                🔄 Restore This Backup
-                            </button>
-                        </div>
-                    </div>
-                `).join('');
+                backupsListEl.replaceChildren();
+                backups.forEach((backup) => {
+                    const item = document.createElement('div');
+                    item.className = 'backup-item';
 
-                // Add event listeners to restore buttons
-                document.querySelectorAll('[data-restore-btn]').forEach(btn => {
-                    btn.addEventListener('click', handleRestore);
+                    const addInfo = (label, value, code = false) => {
+                        const info = document.createElement('div');
+                        info.className = 'backup-info';
+                        const labelEl = document.createElement('b');
+                        labelEl.textContent = `${label}:`;
+                        info.append(labelEl, ' ');
+                        const valueEl = code ? document.createElement('code') : document.createElement('span');
+                        valueEl.textContent = value;
+                        info.append(valueEl);
+                        item.append(info);
+                    };
+
+                    addInfo('Timestamp', formatDate(backup.timestamp));
+                    addInfo('File Size', formatFileSize(backup.size));
+                    addInfo('Type', backup.type || 'backup');
+                    addInfo('Filename', backup.filename, true);
+
+                    const actions = document.createElement('div');
+                    actions.className = 'backup-actions';
+                    const download = document.createElement('a');
+                    download.href = `${API_BASE_URL}/download-backup?file=${encodeURIComponent(backup.filename)}`;
+                    download.download = backup.filename;
+                    const downloadButton = document.createElement('button');
+                    downloadButton.type = 'button';
+                    downloadButton.textContent = '📥 Download';
+                    download.append(downloadButton);
+
+                    const restoreButton = document.createElement('button');
+                    restoreButton.type = 'button';
+                    restoreButton.dataset.restoreBtn = '';
+                    restoreButton.dataset.file = backup.filename;
+                    restoreButton.disabled = roomStatus !== 'stopped';
+                    restoreButton.textContent = '🔄 Restore This Backup';
+                    restoreButton.addEventListener('click', handleRestore);
+                    actions.append(download, restoreButton);
+                    item.append(actions);
+                    backupsListEl.append(item);
                 });
 
             } catch (error) {
@@ -172,6 +194,8 @@
                 const data = await response.json();
                 alert('✅ ' + data.message);
                 loadBackups(); // Reload the list
+                backupActionStatusEl.textContent = `Restore completed: ${filename}`;
+                backupActionStatusEl.className = 'success';
 
             } catch (error) {
                 alert(`❌ Error: ${error.message}`);
@@ -180,6 +204,29 @@
                 btn.textContent = '🔄 Restore This Backup';
             }
         }
+
+        createBackupBtn.addEventListener('click', async () => {
+            createBackupBtn.disabled = true;
+            backupActionStatusEl.className = '';
+            backupActionStatusEl.textContent = 'Creating backup...';
+            try {
+                const response = await fetch(`${API_BASE_URL}/create-backup`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({})
+                });
+                const data = await response.json();
+                if (!response.ok) throw new Error(data.message || 'Failed to create backup');
+                backupActionStatusEl.className = 'success';
+                backupActionStatusEl.textContent = `Backup created: ${data.filename}`;
+                await loadBackups();
+            } catch (error) {
+                backupActionStatusEl.className = 'warning';
+                backupActionStatusEl.textContent = `Backup error: ${error.message}`;
+            } finally {
+                createBackupBtn.disabled = false;
+            }
+        });
 
         // Initialize
         loadBackups();

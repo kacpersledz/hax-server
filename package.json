@@ -5,7 +5,8 @@
   "main": "haxball.mjs",
   "type": "module",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "test:backup": "node scripts/test-backup-restore.mjs"
   },
   "keywords": [
     "haxball",

@@ -280,6 +280,24 @@ const server = http.createServer(async (req, res) => {
                 res.end(JSON.stringify({ message: `Failed to list backups: ${error.message}` }));
             }
         })();
+    } else if (pathname === '/create-backup' && req.method === 'POST') {
+        (async () => {
+            try {
+                const statsTracker = getStatsTracker();
+                const db = statsTracker?.db ?? await getBackupDatabase();
+                const backupPath = await db.createBackup();
+                const backupStats = fs.statSync(backupPath);
+                sendJson(res, 200, {
+                    success: true,
+                    filename: path.basename(backupPath),
+                    sizeBytes: backupStats.size,
+                    createdAt: backupStats.birthtime
+                });
+            } catch (error) {
+                sendJson(res, 500, { message: 'Failed to create backup.' });
+                console.error('[HTTP] Failed to create backup:', error);
+            }
+        })();
     } else if (pathname === '/restore-backup' && req.method === 'POST') {
         let body = '';
         req.on('data', chunk => { body += chunk.toString(); });
@@ -300,8 +318,8 @@ const server = http.createServer(async (req, res) => {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ message: result.message, restoredFrom: result.restoredFrom }));
             } catch (error) {
-                res.writeHead(500, { 'Content-Type': 'application/json' });
-                res.end(JSON.stringify({ message: `Failed to restore backup: ${error.message}` }));
+                sendJson(res, 500, { message: error.publicMessage || 'Failed to restore backup.' });
+                console.error('[HTTP] Failed to restore backup:', error);
             }
         });
     } else if (pathname === '/download-backup' && req.method === 'GET') {

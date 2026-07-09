@@ -1,6 +1,42 @@
 import Database from 'better-sqlite3';
-import { mkdirSync, readdirSync, statSync, copyFileSync } from 'fs';
+import { mkdirSync, readdirSync, statSync, copyFileSync, renameSync, unlinkSync, existsSync } from 'fs';
 import { dirname, join } from 'path';
+
+const BACKUP_FILENAME_RE = /^stats_backup_\d+(?:_safety)?\.db$/;
+
+function ensureBackupDir(dbPath) {
+    const backupsDir = join(dirname(dbPath), 'backups');
+    mkdirSync(backupsDir, { recursive: true });
+    return backupsDir;
+}
+
+function generateBackupFilename(safety = false, backupsDir = null) {
+    let timestamp = Date.now();
+    let filename;
+    do {
+        filename = `stats_backup_${timestamp}${safety ? '_safety' : ''}.db`;
+        timestamp += 1;
+    } while (backupsDir && existsSync(join(backupsDir, filename)));
+    return filename;
+}
+
+function validateBackupFilename(filename) {
+    if (typeof filename !== 'string' || !BACKUP_FILENAME_RE.test(filename)) {
+        throw new Error('Invalid backup filename format');
+    }
+}
+
+function removeSqliteSidecars(dbPath) {
+    for (const sidecar of [`${dbPath}-wal`, `${dbPath}-shm`]) {
+        try {
+            unlinkSync(sidecar);
+        } catch (error) {
+            if (error.code !== 'ENOENT') {
+                throw new Error(`Could not remove SQLite sidecar: ${sidecar}`);
+            }
+        }
+    }
+}
 
 /**
  * StatsDatabase - handles all SQLite operations for Haxball stats
@@ -144,10 +180,10 @@ export class StatsDatabase {
      */
     async createBackup() {
         try {
-            const backupsDir = `${dirname(this.dbPath)}/backups`;
-            mkdirSync(backupsDir, { recursive: true });
+            // TODO: Add explicit backup retention; backups currently grow without a limit.
+            const backupsDir = ensureBackupDir(this.dbPath);
 
-            const backupPath = `${backupsDir}/stats_backup_${Date.now()}.db`;
+            const backupPath = join(backupsDir, generateBackupFilename(false, backupsDir));
             await this.db.backup(backupPath);
 
             console.log(`[DB] Backup created: ${backupPath}`);
@@ -535,7 +571,7 @@ export class StatsDatabase {
      */
     listBackups() {
         try {
-            const backupsDir = `${dirname(this.dbPath)}/backups`;
+            const backupsDir = ensureBackupDir(this.dbPath);
 
             // Check if backups directory exists
             let files;
@@ -547,7 +583,7 @@ export class StatsDatabase {
             }
 
             const backups = files
-                .filter(file => file.startsWith('stats_backup_') && file.endsWith('.db'))
+                .filter(file => BACKUP_FILENAME_RE.test(file))
                 .map(filename => {
                     const filePath = join(backupsDir, filename);
                     const stats = statSync(filePath);
@@ -561,7 +597,9 @@ export class StatsDatabase {
                         filepath: filePath,
                         size: stats.size,
                         timestamp,
-                        createdAt: stats.birthtime
+                        createdAt: stats.birthtime,
+                        modifiedAt: stats.mtime,
+                        type: filename.endsWith('_safety.db') ? 'safety' : 'backup'
                     };
                 });
 
@@ -577,42 +615,50 @@ export class StatsDatabase {
      * Note: This should only be called when room is stopped (no active connection)
      */
     async restoreBackup(filename) {
+        let safetyBackupPath;
+        let temporaryPath;
+        let databaseClosed = false;
+        let databaseReplaced = false;
+
         try {
-            const backupsDir = `${dirname(this.dbPath)}/backups`;
+            validateBackupFilename(filename);
+
+            const backupsDir = ensureBackupDir(this.dbPath);
             const backupPath = join(backupsDir, filename);
 
-            // Validate filename to prevent directory traversal
-            if (!filename.match(/^stats_backup_\d+\.db$/)) {
-                throw new Error('Invalid backup filename format');
-            }
-
             // Check if backup exists
-            let stats;
             try {
-                stats = statSync(backupPath);
+                statSync(backupPath);
             } catch (e) {
                 throw new Error(`Backup file not found: ${filename}`);
             }
 
-            // Close current database connection
+            await this.validateBackupFile(backupPath);
+
+            // Create a consistent safety snapshot before closing the WAL connection.
+            safetyBackupPath = join(backupsDir, generateBackupFilename(true, backupsDir));
+            await this.db.backup(safetyBackupPath);
+            await this.validateBackupFile(safetyBackupPath);
+            console.log(`[DB] Safety backup created: ${safetyBackupPath}`);
+
             this.db.close();
+            databaseClosed = true;
+            removeSqliteSidecars(this.dbPath);
 
-            // Create a safety backup of current database before restoring
-            const safetyBackupPath = `${backupsDir}/stats_backup_${Date.now()}_safety.db`;
-            try {
-                copyFileSync(this.dbPath, safetyBackupPath);
-                console.log(`[DB] Safety backup created: ${safetyBackupPath}`);
-            } catch (e) {
-                console.error('[DB] Warning: Could not create safety backup:', e);
+            temporaryPath = `${this.dbPath}.restore-tmp`;
+            copyFileSync(backupPath, temporaryPath);
+            if (statSync(temporaryPath).size <= 0) {
+                throw new Error('Restore file is empty');
             }
-
-            // Restore from backup
-            copyFileSync(backupPath, this.dbPath);
-            console.log(`[DB] Database restored from: ${backupPath}`);
+            renameSync(temporaryPath, this.dbPath);
+            temporaryPath = null;
+            databaseReplaced = true;
 
             // Reconnect to the restored database
             this.db = new Database(this.dbPath);
             this.db.pragma('journal_mode = WAL');
+            databaseClosed = false;
+            await this.validateOpenDatabase();
             console.log('[DB] Database connection re-established after restore');
 
             return {
@@ -623,16 +669,61 @@ export class StatsDatabase {
         } catch (error) {
             console.error('[DB] Error restoring backup:', error);
 
-            // Try to reconnect to database in case of error
+            if (temporaryPath) {
+                try { unlinkSync(temporaryPath); } catch (cleanupError) {
+                    if (cleanupError.code !== 'ENOENT') console.error('[DB] Could not clean restore temp file:', cleanupError);
+                }
+            }
+
+            // Roll back to the consistent safety snapshot when replacement already started.
             try {
-                this.db = new Database(this.dbPath);
-                this.db.pragma('journal_mode = WAL');
+                const shouldReconnect = databaseReplaced || databaseClosed || !this.db.open;
+                if (databaseReplaced || databaseClosed) {
+                    removeSqliteSidecars(this.dbPath);
+                    const rollbackPath = `${this.dbPath}.restore-tmp`;
+                    copyFileSync(safetyBackupPath, rollbackPath);
+                    renameSync(rollbackPath, this.dbPath);
+                }
+                if (shouldReconnect) {
+                    if (this.db.open) this.db.close();
+                    this.db = new Database(this.dbPath);
+                    this.db.pragma('journal_mode = WAL');
+                    await this.validateOpenDatabase();
+                }
             } catch (e) {
                 console.error('[DB] CRITICAL: Could not reconnect to database after restore error:', e);
             }
 
-            throw error;
+            const publicError = new Error(error.message);
+            publicError.publicMessage = error.publicMessage || error.message;
+            throw publicError;
         }
+    }
+
+    async validateBackupFile(backupPath) {
+        let backupDb;
+        try {
+            backupDb = new Database(backupPath, { readonly: true, fileMustExist: true });
+            const integrity = backupDb.pragma('integrity_check', { simple: true });
+            if (integrity !== 'ok') {
+                throw new Error('Backup failed SQLite integrity_check');
+            }
+            const foreignKeys = backupDb.prepare('PRAGMA foreign_key_check').all();
+            if (foreignKeys.length > 0) {
+                throw new Error('Backup failed SQLite foreign_key_check');
+            }
+        } catch (error) {
+            throw new Error(error.message.startsWith('Backup failed') ? error.message : 'Backup is not a valid SQLite database');
+        } finally {
+            if (backupDb) backupDb.close();
+        }
+    }
+
+    async validateOpenDatabase() {
+        const integrity = this.db.pragma('integrity_check', { simple: true });
+        if (integrity !== 'ok') throw new Error('Restored database failed SQLite integrity_check');
+        const foreignKeys = this.db.prepare('PRAGMA foreign_key_check').all();
+        if (foreignKeys.length > 0) throw new Error('Restored database failed SQLite foreign_key_check');
     }
 
     /**
