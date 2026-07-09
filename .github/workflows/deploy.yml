@@ -16,4 +16,4 @@ jobs:
           method: "POST"
           username: ${{ secrets.WEBHOOK_USERNAME }}
           password: ${{ secrets.WEBHOOK_PASSWORD }}
-          data: '[{ "Name": "hax-server", "Version": "0.1.0" }]'
+          data: '[{ "Name": "hax-server/app", "Version": "0.1.0" }]'
