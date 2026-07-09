@@ -233,6 +233,18 @@ export class StatsDatabase {
     }
 
     /**
+     * Get all players for admin tools
+     */
+    getAllPlayers() {
+        const stmt = this.db.prepare(`
+            SELECT *
+            FROM players
+            ORDER BY LOWER(name), last_seen DESC
+        `);
+        return stmt.all();
+    }
+
+    /**
      * Save match to database
      */
     saveMatch(matchData) {
@@ -400,6 +412,122 @@ export class StatsDatabase {
         });
 
         return deleteTransaction();
+    }
+
+    /**
+     * Merge one player into another by auth
+     * Source player is removed after stats and match history are merged into target
+     */
+    async mergePlayers(sourceAuth, targetAuth) {
+        if (!sourceAuth || !targetAuth) {
+            throw new Error('Source auth and target auth are required');
+        }
+
+        if (sourceAuth === targetAuth) {
+            throw new Error('Source auth and target auth must be different');
+        }
+
+        // Create backup first - if it fails, merge will not proceed
+        const backupPath = await this.createBackup();
+        console.log('[DB] Backup successful, proceeding with player merge');
+
+        const mergeTransaction = this.db.transaction(() => {
+            const source = this.getPlayer(sourceAuth);
+            const target = this.getPlayer(targetAuth);
+
+            if (!source) {
+                throw new Error(`Source player not found: ${sourceAuth}`);
+            }
+
+            if (!target) {
+                throw new Error(`Target player not found: ${targetAuth}`);
+            }
+
+            const conflictRows = this.db.prepare(`
+                SELECT source_mp.match_id, source_mp.goals, source_mp.assists
+                FROM match_players source_mp
+                INNER JOIN match_players target_mp
+                    ON target_mp.match_id = source_mp.match_id
+                    AND target_mp.player_auth = ?
+                WHERE source_mp.player_auth = ?
+            `).all(targetAuth, sourceAuth);
+
+            const mergedMatchConflicts = conflictRows.length;
+
+            const mergeMatchStats = this.db.prepare(`
+                UPDATE match_players
+                SET goals = goals + ?, assists = assists + ?
+                WHERE match_id = ? AND player_auth = ?
+            `);
+
+            const deleteSourceMatchRow = this.db.prepare(`
+                DELETE FROM match_players
+                WHERE match_id = ? AND player_auth = ?
+            `);
+
+            for (const row of conflictRows) {
+                mergeMatchStats.run(row.goals, row.assists, row.match_id, targetAuth);
+                deleteSourceMatchRow.run(row.match_id, sourceAuth);
+            }
+
+            const moveResult = this.db.prepare(`
+                UPDATE match_players
+                SET player_auth = ?
+                WHERE player_auth = ?
+            `).run(targetAuth, sourceAuth);
+
+            this.db.prepare(`
+                UPDATE players
+                SET
+                    goals = goals + ?,
+                    assists = assists + ?,
+                    own_goals = own_goals + ?,
+                    games = games + ?,
+                    wins = wins + ?,
+                    losses = losses + ?,
+                    draws = draws + ?,
+                    clean_sheets = clean_sheets + ?,
+                    minutes_played = minutes_played + ?,
+                    best_streak = MAX(best_streak, ?),
+                    last_seen = MAX(last_seen, ?)
+                WHERE auth = ?
+            `).run(
+                source.goals,
+                source.assists,
+                source.own_goals,
+                source.games,
+                source.wins,
+                source.losses,
+                source.draws,
+                source.clean_sheets,
+                source.minutes_played,
+                source.best_streak,
+                source.last_seen,
+                targetAuth
+            );
+
+            this.db.prepare('DELETE FROM players WHERE auth = ?').run(sourceAuth);
+
+            const finalStats = this.getPlayer(targetAuth);
+
+            console.log(`[DB] Merged player "${source.name}" (${sourceAuth}) into "${target.name}" (${targetAuth})`);
+
+            return {
+                source: {
+                    auth: source.auth,
+                    name: source.name
+                },
+                target: {
+                    auth: target.auth,
+                    name: target.name
+                },
+                movedMatchRows: moveResult.changes,
+                mergedMatchConflicts,
+                finalStats
+            };
+        });
+
+        return mergeTransaction();
     }
 
     /**

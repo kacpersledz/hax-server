@@ -14,9 +14,23 @@ let backupDb = null;
 async function getBackupDatabase() {
     if (!backupDb) {
         backupDb = new StatsDatabase('./data/stats.db');
-        await backupDb.connect();
+        backupDb.initialize();
     }
     return backupDb;
+}
+
+function sendJson(res, statusCode, data) {
+    res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(data));
+}
+
+function ensureRoomStopped(res, action) {
+    const { status } = getRoomState();
+    if (status !== 'stopped') {
+        sendJson(res, 400, { message: `Cannot ${action} while room is ${status}. Please stop the room first.` });
+        return false;
+    }
+    return true;
 }
 
 // Function to send the current state to all connected clients
@@ -98,6 +112,26 @@ const server = http.createServer(async (req, res) => {
                 res.end(data);
             }
         });
+    } else if (pathname === '/merge-players') {
+        fs.readFile('merge-players.html', (err, data) => {
+            if (err) {
+                res.writeHead(500);
+                res.end('Error loading merge-players.html');
+            } else {
+                res.writeHead(200, { 'Content-Type': 'text/html' });
+                res.end(data);
+            }
+        });
+    } else if (pathname === '/danger-zone') {
+        fs.readFile('danger-zone.html', (err, data) => {
+            if (err) {
+                res.writeHead(500);
+                res.end('Error loading danger-zone.html');
+            } else {
+                res.writeHead(200, { 'Content-Type': 'text/html' });
+                res.end(data);
+            }
+        });
     } else if (pathname === '/events') {
         // SSE endpoint
         res.writeHead(200, {
@@ -144,13 +178,10 @@ const server = http.createServer(async (req, res) => {
     } else if (pathname === '/clear-stats' && req.method === 'POST') {
         (async () => {
             try {
+                if (!ensureRoomStopped(res, 'clear statistics')) return;
                 const statsTracker = getStatsTracker();
-                if (!statsTracker) {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ message: "Stats tracker not initialized. Start the room first." }));
-                    return;
-                }
-                await statsTracker.clearStats();
+                const db = statsTracker?.db ?? await getBackupDatabase();
+                await db.clearStats();
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ message: "Statistics cleared successfully." }));
             } catch (error) {
@@ -161,13 +192,10 @@ const server = http.createServer(async (req, res) => {
     } else if (pathname === '/delete-test-players' && req.method === 'POST') {
         (async () => {
             try {
+                if (!ensureRoomStopped(res, 'delete test players')) return;
                 const statsTracker = getStatsTracker();
-                if (!statsTracker) {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ message: "Stats tracker not initialized. Start the room first." }));
-                    return;
-                }
-                const deletedCount = await statsTracker.deleteTestPlayers();
+                const db = statsTracker?.db ?? await getBackupDatabase();
+                const deletedCount = await db.deleteTestPlayers();
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ message: `Deleted ${deletedCount} test player(s) and their statistics.` }));
             } catch (error) {
@@ -180,6 +208,7 @@ const server = http.createServer(async (req, res) => {
         req.on('data', chunk => { body += chunk.toString(); });
         req.on('end', async () => {
             try {
+                if (!ensureRoomStopped(res, 'delete player stats')) return;
                 const { playerName } = JSON.parse(body);
                 if (!playerName) {
                     res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -187,12 +216,8 @@ const server = http.createServer(async (req, res) => {
                     return;
                 }
                 const statsTracker = getStatsTracker();
-                if (!statsTracker) {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ message: "Stats tracker not initialized. Start the room first." }));
-                    return;
-                }
-                const result = await statsTracker.deletePlayerStats(playerName);
+                const db = statsTracker?.db ?? await getBackupDatabase();
+                const result = await db.deletePlayerStats(playerName);
                 if (result === null) {
                     res.writeHead(404, { 'Content-Type': 'application/json' });
                     res.end(JSON.stringify({ message: `Player "${playerName}" not found.` }));
@@ -203,6 +228,44 @@ const server = http.createServer(async (req, res) => {
             } catch (error) {
                 res.writeHead(500, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ message: `Failed to delete player stats: ${error.message}` }));
+            }
+        });
+    } else if (pathname === '/players' && req.method === 'GET') {
+        (async () => {
+            try {
+                const statsTracker = getStatsTracker();
+                const db = statsTracker?.db ?? await getBackupDatabase();
+                const players = db.getAllPlayers();
+                sendJson(res, 200, players);
+            } catch (error) {
+                sendJson(res, 500, { message: `Failed to list players: ${error.message}` });
+            }
+        })();
+    } else if (pathname === '/merge-players' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => { body += chunk.toString(); });
+        req.on('end', async () => {
+            try {
+                if (!ensureRoomStopped(res, 'merge players')) return;
+                const { sourceAuth, targetAuth } = JSON.parse(body);
+                if (!sourceAuth || !targetAuth) {
+                    sendJson(res, 400, { message: "Source auth and target auth are required." });
+                    return;
+                }
+                if (sourceAuth === targetAuth) {
+                    sendJson(res, 400, { message: "Source auth and target auth must be different." });
+                    return;
+                }
+
+                const statsTracker = getStatsTracker();
+                const db = statsTracker?.db ?? await getBackupDatabase();
+                const result = await db.mergePlayers(sourceAuth, targetAuth);
+                sendJson(res, 200, {
+                    message: `Merged player "${result.source.name}" into "${result.target.name}".`,
+                    ...result
+                });
+            } catch (error) {
+                sendJson(res, 500, { message: `Failed to merge players: ${error.message}` });
             }
         });
     } else if (pathname === '/list-backups' && req.method === 'GET') {
@@ -223,12 +286,7 @@ const server = http.createServer(async (req, res) => {
         req.on('data', chunk => { body += chunk.toString(); });
         req.on('end', async () => {
             try {
-                const { status } = getRoomState();
-                if (status !== 'stopped') {
-                    res.writeHead(400, { 'Content-Type': 'application/json' });
-                    res.end(JSON.stringify({ message: `Cannot restore backup while room is ${status}. Please stop the room first.` }));
-                    return;
-                }
+                if (!ensureRoomStopped(res, 'restore backup')) return;
 
                 const { filename } = JSON.parse(body);
                 if (!filename) {

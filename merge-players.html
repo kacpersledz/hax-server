@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Haxball Merge Players</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; padding: 1em; max-width: 900px; margin: 0 auto; }
+        h1, h2, h3 { color: #333; }
+        button { font-size: 1em; padding: 0.5em 1em; cursor: pointer; }
+        button:disabled { cursor: not-allowed; opacity: 0.6; }
+        a { color: #007bff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        input, select { box-sizing: border-box; padding: 0.5em; font-size: 1em; width: 100%; }
+        label { font-weight: bold; display: block; margin-bottom: 0.35em; }
+        #status { background-color: #f4f4f4; padding: 1em; border-radius: 5px; margin-bottom: 1.5em; }
+        #merge-form { border: 1px solid #ddd; border-radius: 5px; padding: 1em; background-color: #f9f9f9; }
+        .field { margin-bottom: 1em; }
+        .warning { color: #dc3545; font-weight: bold; }
+        .success { color: #28a745; font-weight: bold; }
+        .nav-links { margin-bottom: 2em; padding-bottom: 1em; border-bottom: 1px solid #ddd; }
+        #result { margin-top: 1.5em; padding: 1em; border-radius: 5px; display: none; }
+        #result.success-box { display: block; background-color: #f0fff4; border: 1px solid #28a745; }
+        #result.error-box { display: block; background-color: #fff5f5; border: 1px solid #dc3545; }
+        code { background: #eee; padding: 0.1em 0.3em; border-radius: 3px; }
+    </style>
+</head>
+<body>
+    <div class="nav-links">
+        <a href="/">← Back to Admin</a>
+    </div>
+
+    <h1>Merge Players</h1>
+
+    <div id="status">
+        <h2>Room Status</h2>
+        <p><b id="status-message">Connecting...</b></p>
+        <p id="room-warning" class="warning" style="display: none;">⚠️ Room is currently running. Please stop the room before merging players.</p>
+    </div>
+
+    <div id="merge-form">
+        <h2>Merge by Auth</h2>
+        <p>Select the duplicate/source player and the target player. The source player will be deleted after its stats and match history are merged into the target player.</p>
+
+        <div class="field">
+            <label for="source-auth">Source player auth (will be removed)</label>
+            <select id="source-auth"></select>
+        </div>
+
+        <div class="field">
+            <label for="target-auth">Target player auth (will remain)</label>
+            <select id="target-auth"></select>
+        </div>
+
+        <div class="field">
+            <label for="confirm-input">Type <code>MERGE</code> to enable the merge button</label>
+            <input type="text" id="confirm-input" placeholder="MERGE">
+        </div>
+
+        <button type="button" id="merge-btn" disabled>🔀 Merge Players</button>
+        <button type="button" id="refresh-btn">Refresh Players</button>
+    </div>
+
+    <div id="result"></div>
+
+    <script>
+        const statusMessageEl = document.getElementById('status-message');
+        const roomWarningEl = document.getElementById('room-warning');
+        const sourceAuthEl = document.getElementById('source-auth');
+        const targetAuthEl = document.getElementById('target-auth');
+        const confirmInputEl = document.getElementById('confirm-input');
+        const mergeBtn = document.getElementById('merge-btn');
+        const refreshBtn = document.getElementById('refresh-btn');
+        const resultEl = document.getElementById('result');
+        const API_BASE_URL = '';
+        let roomStatus = 'stopped';
+        let players = [];
+
+        function escapeHtml(value) {
+            return String(value).replace(/[&<>"']/g, char => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            }[char]));
+        }
+
+        function formatPlayer(player) {
+            return `${player.name} | auth: ${player.auth} | games: ${player.games} | goals: ${player.goals} | last seen: ${player.last_seen || 'N/A'}`;
+        }
+
+        function updateMergeButton() {
+            mergeBtn.disabled = roomStatus !== 'stopped'
+                || confirmInputEl.value.trim() !== 'MERGE'
+                || !sourceAuthEl.value
+                || !targetAuthEl.value
+                || sourceAuthEl.value === targetAuthEl.value;
+        }
+
+        function updateUI(state) {
+            roomStatus = state.status;
+            statusMessageEl.textContent = state.status_message || 'N/A';
+            statusMessageEl.style.color = state.status === 'running' ? 'green' : (state.status === 'stopped' ? 'red' : 'orange');
+            roomWarningEl.style.display = state.status === 'stopped' ? 'none' : 'block';
+            updateMergeButton();
+        }
+
+        function showResult(html, isError = false) {
+            resultEl.className = isError ? 'error-box' : 'success-box';
+            resultEl.innerHTML = html;
+        }
+
+        async function loadPlayers() {
+            try {
+                refreshBtn.disabled = true;
+                refreshBtn.textContent = 'Loading...';
+                const response = await fetch(`${API_BASE_URL}/players`);
+                if (!response.ok) {
+                    const data = await response.json();
+                    throw new Error(data.message || 'Failed to load players');
+                }
+
+                players = await response.json();
+                sourceAuthEl.replaceChildren(new Option('Select player...', ''));
+                targetAuthEl.replaceChildren(new Option('Select player...', ''));
+                for (const player of players) {
+                    sourceAuthEl.add(new Option(formatPlayer(player), player.auth));
+                    targetAuthEl.add(new Option(formatPlayer(player), player.auth));
+                }
+                updateMergeButton();
+            } catch (error) {
+                showResult(`❌ Error loading players: ${error.message}`, true);
+                console.error('Error loading players:', error);
+            } finally {
+                refreshBtn.disabled = false;
+                refreshBtn.textContent = 'Refresh Players';
+            }
+        }
+
+        mergeBtn.addEventListener('click', async () => {
+            const sourceAuth = sourceAuthEl.value;
+            const targetAuth = targetAuthEl.value;
+            if (roomStatus !== 'stopped') {
+                alert('⚠️ Room must be stopped before merging players. Please stop the room first.');
+                return;
+            }
+            if (!sourceAuth || !targetAuth || sourceAuth === targetAuth) {
+                alert('⚠️ Select two different players.');
+                return;
+            }
+            if (confirmInputEl.value.trim() !== 'MERGE') {
+                alert('⚠️ Type MERGE to confirm.');
+                return;
+            }
+
+            const source = players.find(player => player.auth === sourceAuth);
+            const target = players.find(player => player.auth === targetAuth);
+            const firstConfirm = confirm(`⚠️ Merge source player into target player?\n\nSource: ${source ? formatPlayer(source) : sourceAuth}\n\nTarget: ${target ? formatPlayer(target) : targetAuth}\n\nThe source player will be deleted.`);
+            if (!firstConfirm) return;
+            const secondConfirm = confirm('⚠️ FINAL WARNING: This action changes player statistics and match history. A backup will be created first. Continue?');
+            if (!secondConfirm) return;
+
+            try {
+                mergeBtn.disabled = true;
+                mergeBtn.textContent = 'Merging...';
+                const response = await fetch(`${API_BASE_URL}/merge-players`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sourceAuth, targetAuth })
+                });
+                const data = await response.json();
+                if (!response.ok) {
+                    throw new Error(data.message || 'Failed to merge players');
+                }
+
+                showResult(`
+                    <h3>✅ Players merged successfully</h3>
+                    <p><b>Source:</b> ${escapeHtml(data.source.name)} (<code>${escapeHtml(data.source.auth)}</code>)</p>
+                    <p><b>Target:</b> ${escapeHtml(data.target.name)} (<code>${escapeHtml(data.target.auth)}</code>)</p>
+                    <p><b>Moved match rows:</b> ${data.movedMatchRows}</p>
+                    <p><b>Merged same-match conflicts:</b> ${data.mergedMatchConflicts}</p>
+                    <p><b>Final target stats:</b> ${data.finalStats.games} games, ${data.finalStats.goals} goals, ${data.finalStats.assists} assists</p>
+                `);
+                confirmInputEl.value = '';
+                await loadPlayers();
+            } catch (error) {
+                showResult(`❌ Error merging players: ${error.message}`, true);
+                console.error('Error merging players:', error);
+            } finally {
+                mergeBtn.textContent = '🔀 Merge Players';
+                updateMergeButton();
+            }
+        });
+
+        refreshBtn.addEventListener('click', loadPlayers);
+        sourceAuthEl.addEventListener('change', updateMergeButton);
+        targetAuthEl.addEventListener('change', updateMergeButton);
+        confirmInputEl.addEventListener('input', updateMergeButton);
+
+        loadPlayers();
+
+        const eventSource = new EventSource('/events');
+        eventSource.onmessage = (event) => updateUI(JSON.parse(event.data));
+        eventSource.onerror = (err) => {
+            console.error('EventSource failed:', err);
+            statusMessageEl.textContent = 'Connection to server lost. Please refresh the page.';
+            statusMessageEl.style.color = 'red';
+            mergeBtn.disabled = true;
+        };
+    </script>
+</body>
+</html>

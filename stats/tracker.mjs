@@ -407,6 +407,20 @@ export class HaxballStatsTracker {
     }
 
     /**
+     * Get all players for admin tools
+     */
+    getAllPlayers() {
+        return this.db.getAllPlayers();
+    }
+
+    /**
+     * Merge one player into another by auth
+     */
+    async mergePlayers(sourceAuth, targetAuth) {
+        return await this.db.mergePlayers(sourceAuth, targetAuth);
+    }
+
+    /**
      * Close database connection
      */
     close() {
