@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Haxball Danger Zone</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; padding: 1em; max-width: 900px; margin: 0 auto; }
+        h1, h2, h3 { color: #333; }
+        button { font-size: 1em; padding: 0.5em 1em; margin-right: 0.5em; cursor: pointer; }
+        button:disabled { cursor: not-allowed; opacity: 0.6; }
+        a { color: #007bff; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        #status { background-color: #f4f4f4; padding: 1em; border-radius: 5px; margin-bottom: 1.5em; }
+        #danger-zone { margin-top: 2em; padding: 1em; border: 2px solid #dc3545; border-radius: 5px; background-color: #fff5f5; }
+        .warning { color: #dc3545; font-weight: bold; }
+        .nav-links { margin-bottom: 2em; padding-bottom: 1em; border-bottom: 1px solid #ddd; }
+        input { padding: 0.5em; font-size: 1em; }
+    </style>
+</head>
+<body>
+    <div class="nav-links">
+        <a href="/">← Back to Admin</a>
+    </div>
+
+    <h1>Danger Zone</h1>
+
+    <div id="status">
+        <h2>Room Status</h2>
+        <p><b id="status-message">Connecting...</b></p>
+        <p id="room-warning" class="warning" style="display: none;">⚠️ Room is currently running. Please stop the room before destructive database operations.</p>
+    </div>
+
+    <div id="danger-zone">
+        <h3 style="color: #dc3545;">Destructive Database Actions</h3>
+        <p>Permanently delete all statistics from the database. This action cannot be undone.</p>
+        <button type="button" id="clear-stats-btn" data-danger-action style="background-color: #dc3545; color: white; border: none;">Clear Database</button>
+        <p style="margin-top: 1.5em;">Delete all test players (names starting with <code>___test</code>) and their statistics.</p>
+        <button type="button" id="delete-test-btn" data-danger-action style="background-color: #ffc107; color: black; border: none;">Delete Test Players</button>
+        <p style="margin-top: 1.5em;">Delete statistics for a specific player by name.</p>
+        <div style="display: flex; gap: 0.5em; align-items: center; flex-wrap: wrap;">
+            <input type="text" id="player-name-input" placeholder="Enter player name..." style="flex-grow: 1; min-width: 240px;">
+            <button type="button" id="delete-player-btn" data-danger-action style="background-color: #fd7e14; color: white; border: none;">Delete Player Stats</button>
+        </div>
+    </div>
+
+    <script>
+        const statusMessageEl = document.getElementById('status-message');
+        const roomWarningEl = document.getElementById('room-warning');
+        const clearStatsBtn = document.getElementById('clear-stats-btn');
+        const deleteTestBtn = document.getElementById('delete-test-btn');
+        const deletePlayerBtn = document.getElementById('delete-player-btn');
+        const playerNameInput = document.getElementById('player-name-input');
+        const API_BASE_URL = '';
+        let roomStatus = 'stopped';
+
+        function updateUI(state) {
+            roomStatus = state.status;
+            statusMessageEl.textContent = state.status_message || 'N/A';
+            statusMessageEl.style.color = state.status === 'running' ? 'green' : (state.status === 'stopped' ? 'red' : 'orange');
+            roomWarningEl.style.display = state.status === 'stopped' ? 'none' : 'block';
+            document.querySelectorAll('[data-danger-action]').forEach(btn => {
+                btn.disabled = state.status !== 'stopped';
+            });
+        }
+
+        function requireStoppedRoom() {
+            if (roomStatus !== 'stopped') {
+                alert('⚠️ Room must be stopped before destructive database operations. Please stop the room first.');
+                return false;
+            }
+            return true;
+        }
+
+        clearStatsBtn.addEventListener('click', async () => {
+            if (!requireStoppedRoom()) return;
+            const firstConfirm = confirm('⚠️ WARNING: This will permanently delete ALL statistics from the database.\n\nAre you sure you want to continue?');
+            if (!firstConfirm) return;
+
+            const secondConfirm = confirm('⚠️ FINAL WARNING: This action CANNOT be undone!\n\nAll player stats, matches, and history will be PERMANENTLY deleted.\n\nDo you really want to proceed?');
+            if (!secondConfirm) return;
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/clear-stats`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                if (!response.ok) {
+                    const responseData = await response.json();
+                    throw new Error(responseData.message || 'Failed to clear statistics');
+                }
+
+                const responseData = await response.json();
+                alert('✅ ' + responseData.message);
+            } catch (error) {
+                alert(`❌ Error: ${error.message}`);
+                console.error('Error clearing statistics:', error);
+            }
+        });
+
+        deleteTestBtn.addEventListener('click', async () => {
+            if (!requireStoppedRoom()) return;
+            const confirmDelete = window.confirm('⚠️ This will delete all test players (names starting with ___test) and their statistics.\n\nAre you sure?');
+            if (!confirmDelete) return;
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/delete-test-players`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+
+                if (!response.ok) {
+                    const responseData = await response.json();
+                    throw new Error(responseData.message || 'Failed to delete test players');
+                }
+
+                const responseData = await response.json();
+                alert('✅ ' + responseData.message);
+            } catch (error) {
+                alert(`❌ Error: ${error.message}`);
+                console.error('Error deleting test players:', error);
+            }
+        });
+
+        deletePlayerBtn.addEventListener('click', async () => {
+            if (!requireStoppedRoom()) return;
+            const playerName = playerNameInput.value.trim();
+            if (!playerName) {
+                alert('⚠️ Please enter a player name.');
+                return;
+            }
+
+            const firstConfirm = confirm(`⚠️ This will permanently delete all statistics for player "${playerName}" and remove them from all matches.\n\nAre you sure you want to continue?`);
+            if (!firstConfirm) return;
+
+            const secondConfirm = confirm(`⚠️ FINAL WARNING: This action CANNOT be undone!\n\nAll stats for "${playerName}" will be PERMANENTLY deleted.\n\nDo you really want to proceed?`);
+            if (!secondConfirm) return;
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/delete-player-stats`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ playerName })
+                });
+
+                if (!response.ok) {
+                    const responseData = await response.json();
+                    throw new Error(responseData.message || 'Failed to delete player stats');
+                }
+
+                const responseData = await response.json();
+                alert('✅ ' + responseData.message);
+                playerNameInput.value = '';
+            } catch (error) {
+                alert(`❌ Error: ${error.message}`);
+                console.error('Error deleting player stats:', error);
+            }
+        });
+
+        const eventSource = new EventSource('/events');
+        eventSource.onmessage = (event) => updateUI(JSON.parse(event.data));
+        eventSource.onerror = (err) => {
+            console.error('EventSource failed:', err);
+            statusMessageEl.textContent = 'Connection to server lost. Please refresh the page.';
+            statusMessageEl.style.color = 'red';
+            document.querySelectorAll('[data-danger-action]').forEach(btn => { btn.disabled = true; });
+        };
+    </script>
+</body>
+</html>
