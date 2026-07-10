@@ -6,7 +6,8 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "test:backup": "node scripts/test-backup-restore.mjs"
+    "test:backup": "node scripts/test-backup-restore.mjs",
+    "test:goals": "node --test tests/goal-attribution.test.mjs"
   },
   "keywords": [
     "haxball",

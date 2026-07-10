@@ -109,8 +109,10 @@ export class HaxballStatsTracker {
             const isOwnGoal = scorer.team !== team;
 
             if (isOwnGoal) {
-                // Own goal - update in database immediately
-                this.db.updatePlayerStats(scorer.auth, { own_goals: 1 });
+                // Own goal - update in database immediately only for stable auth identities.
+                if (scorer.auth) {
+                    this.db.updatePlayerStats(scorer.auth, { own_goals: 1 });
+                }
                 console.log(`[Stats] Own goal by ${scorer.name}`);
             } else {
                 // Regular goal
