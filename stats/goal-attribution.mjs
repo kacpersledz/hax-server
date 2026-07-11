@@ -1,14 +1,3 @@
-export const GOAL_ATTRIBUTION_DEFAULTS = Object.freeze({
-    assistTimeWindowMs: 3000,
-    maxGoalTouchAgeMs: 3000,
-    samePlayerTouchThrottleMs: 700,
-    proximityAfterKickSuppressMs: 250,
-    maxTouches: 30,
-    contactTolerance: 0.5,
-    tieDistanceTolerance: 0.01,
-    diagnostics: false,
-});
-
 export function createGoalAttributionEngine(options = {}) {
     const DEFAULTS = {
         assistTimeWindowMs: 3000,
@@ -50,19 +39,28 @@ export function createGoalAttributionEngine(options = {}) {
         source: touch.source || 'proximity',
     });
 
+    function mergeLastTouch(touch) {
+        const last = touches[touches.length - 1];
+        touches[touches.length - 1] = { ...last, ...touch };
+        debug('touch-updated', touches[touches.length - 1]);
+    }
+
     function shouldRecord(touch) {
         const last = touches[touches.length - 1];
-        if (!last) return true;
-        if (!samePlayer(last, touch)) return true;
+        if (!last) return { action: 'append' };
+        if (!samePlayer(last, touch)) return { action: 'append' };
 
         const elapsed = touch.timestamp - last.timestamp;
         if (touch.source === 'proximity' && last.source === 'kick' && elapsed <= config.proximityAfterKickSuppressMs) {
-            return false;
+            return { action: 'ignore' };
         }
-        if (touch.source === 'kick' && last.source === 'proximity' && elapsed > config.proximityAfterKickSuppressMs) {
-            return true;
+        if (touch.source === 'kick' && last.source === 'proximity') {
+            return { action: 'replace-last' };
         }
-        return elapsed >= config.samePlayerTouchThrottleMs;
+        if (elapsed >= config.samePlayerTouchThrottleMs) {
+            return { action: 'append' };
+        }
+        return { action: 'ignore' };
     }
 
     function recordTouch(touch) {
@@ -72,14 +70,19 @@ export function createGoalAttributionEngine(options = {}) {
             lastKickPlayerId = normalized.playerId;
             lastKickTimestamp = normalized.timestamp;
         }
-        if (!shouldRecord(normalized)) return false;
+        const decision = shouldRecord(normalized);
+        if (decision.action === 'ignore') return false;
+        if (decision.action === 'replace-last') {
+            mergeLastTouch(normalized);
+            return true;
+        }
         touches.push(normalized);
         if (touches.length > config.maxTouches) touches = touches.slice(-config.maxTouches);
         debug('touch', normalized);
         return true;
     }
 
-    function findAssist(scorerTouch, scorerIndex, scoringTeam, goalTimestamp) {
+    function findAssist(scorerTouch, scorerIndex, scoringTeam) {
         let blockedByOpponent = false;
         for (let i = scorerIndex - 1; i >= 0; i--) {
             const touch = touches[i];
@@ -88,8 +91,8 @@ export function createGoalAttributionEngine(options = {}) {
                 blockedByOpponent = true;
                 break;
             }
-            const age = goalTimestamp - touch.timestamp;
-            if (age > config.assistTimeWindowMs) {
+            const passToScorerTime = scorerTouch.timestamp - touch.timestamp;
+            if (passToScorerTime > config.assistTimeWindowMs) {
                 return { assister: null, reason: 'assist-expired' };
             }
             return { assister: publicPlayer(touch), reason: 'assist-found' };
@@ -113,7 +116,7 @@ export function createGoalAttributionEngine(options = {}) {
             return result;
         }
 
-        const assist = findAssist(lastTouch, lastIndex, scoringTeam, goalTimestamp);
+        const assist = findAssist(lastTouch, lastIndex, scoringTeam);
         const result = { type: 'goal', scorer: publicPlayer(lastTouch), assister: assist.assister, isOwnGoal: false, confidence: 'high', reason: 'last-touch-scoring-team', assistReason: assist.reason };
         debug('goal', result, touches.slice(-6));
         return result;

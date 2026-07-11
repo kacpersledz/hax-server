@@ -79,8 +79,13 @@ test('proximity contact can decide goal', () => {
 });
 
 test('deduplicates kick followed by proximity for same player', () => {
-    const e = engine(); assert.equal(e.recordTouch(touch(P.A, 1000, 'kick')), true); assert.equal(e.recordTouch(touch(P.A, 1050, 'proximity')), false);
-    assert.equal(e.getTouches().length, 1);
+    const e = engine();
+    assert.equal(e.recordTouch(touch(P.A, 1000, 'kick')), true);
+    assert.equal(e.recordTouch(touch(P.A, 1050, 'proximity')), false);
+    const history = e.getTouches();
+    assert.equal(history.length, 1);
+    assert.equal(history[0].source, 'kick');
+    assert.equal(history[0].timestamp, 1000);
 });
 
 test('selects closest simultaneous contact deterministically', () => {
@@ -126,4 +131,36 @@ test('tie contact prefers recent kicker rather than array order', () => {
     ];
     const contact = e.selectClosestContact({ ballPosition: { x: 0, y: 0 }, ballRadius: 10, timestamp: 1100, players });
     assert.equal(contact.player.id, 2);
+});
+
+test('assist window is measured from passer touch to scorer touch, not to goal time', () => {
+    const e = engine({ assistTimeWindowMs: 3000 });
+    e.recordTouch(touch(P.A, 1000));
+    e.recordTouch(touch(P.B, 3500));
+    const r = e.resolveGoal({ scoringTeam: RED, timestamp: 4300 });
+    assert.equal(r.scorer.name, 'B');
+    assert.equal(r.assister.name, 'A');
+    assert.equal(r.assistReason, 'assist-found');
+});
+
+test('assist expires when passer to scorer touch exceeds the assist window', () => {
+    const e = engine({ assistTimeWindowMs: 3000 });
+    e.recordTouch(touch(P.A, 1000));
+    e.recordTouch(touch(P.B, 4500));
+    const r = e.resolveGoal({ scoringTeam: RED, timestamp: 4600 });
+    assert.equal(r.scorer.name, 'B');
+    assert.equal(r.assister, null);
+    assert.equal(r.assistReason, 'assist-expired');
+});
+
+test('proximity followed by kick updates the last touch instead of losing the kick', () => {
+    const e = engine();
+    assert.equal(e.recordTouch(touch(P.A, 1000, 'proximity')), true);
+    assert.equal(e.recordTouch(touch(P.A, 1050, 'kick')), true);
+    const history = e.getTouches();
+    assert.equal(history.length, 1);
+    assert.equal(history[0].source, 'kick');
+    assert.equal(history[0].timestamp, 1050);
+    const r = e.resolveGoal({ scoringTeam: RED, timestamp: 1100 });
+    assert.equal(r.scorer.name, 'A');
 });

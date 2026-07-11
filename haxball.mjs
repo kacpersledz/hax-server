@@ -62,7 +62,7 @@ async function initializeRoom(token = null) {
 
     const goalAttributionFactorySource = `(${createGoalAttributionEngine.toString()})`;
 
-    await state.page.evaluate((config, goalAttributionFactorySource) => {
+    await state.page.evaluate(({ config, goalAttributionFactorySource }) => {
         const room = window.HBInit(config);
         const createGoalAttributionEngine = eval(goalAttributionFactorySource);
         room.setDefaultStadium("Rounded");
@@ -344,11 +344,14 @@ async function initializeRoom(token = null) {
             const timestamp = Date.now();
             const players = room.getPlayerList()
                 .filter(player => player.team !== 0)
-                .map(player => ({
-                    ...player,
-                    disc: room.getPlayerDiscProperties(player.id),
-                    playerRadius: room.getPlayerDiscProperties(player.id)?.radius,
-                }));
+                .map(player => {
+                    const disc = room.getPlayerDiscProperties(player.id);
+                    return {
+                        ...player,
+                        disc,
+                        playerRadius: disc?.radius,
+                    };
+                });
 
             const contact = goalAttribution.selectClosestContact({
                 ballPosition,
@@ -399,7 +402,10 @@ async function initializeRoom(token = null) {
 
             return true;
         };
-    }, roomConfig, goalAttributionFactorySource);
+    }, {
+        config: roomConfig,
+        goalAttributionFactorySource,
+    });
 
     updateState({ status_message: 'Room script executed. Waiting for room link...' });
 }
