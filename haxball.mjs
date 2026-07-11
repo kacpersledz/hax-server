@@ -1,5 +1,6 @@
 import { chromium } from "playwright";
 import { HaxballStatsTracker } from "./stats/index.mjs";
+import { createGoalAttributionEngine } from "./stats/goal-attribution.mjs";
 
 // The WebSocket endpoint for the existing Playwright server.
 const wsPath = process.env.WS_PATH;
@@ -59,18 +60,25 @@ async function initializeRoom(token = null) {
         token: token, // Pass the token here
     };
 
-    await state.page.evaluate((config) => {
+    const goalAttributionFactorySource = `(${createGoalAttributionEngine.toString()})`;
+
+    await state.page.evaluate(({ config, goalAttributionFactorySource }) => {
         const room = window.HBInit(config);
+        const createGoalAttributionEngine = eval(goalAttributionFactorySource);
         room.setDefaultStadium("Rounded");
         room.setScoreLimit(0);
         room.setTimeLimit(3);
         room.onRoomLink = (url) => window.onRoomLinkSet(url);
 
         // Stats tracking state
-        const ASSIST_TIME_WINDOW = 3000; // 3 seconds
+        const goalAttribution = createGoalAttributionEngine({
+            assistTimeWindowMs: 3000,
+            maxGoalTouchAgeMs: 3000,
+            diagnostics: config.goalAttributionDiagnostics === true,
+        });
+
         let gameState = {
             isGameRunning: false,
-            lastTouches: [], // { playerId, playerAuth, playerName, playerTeam, timestamp }
             matchGoals: {}, // { auth: { name, team, goals, assists } }
             playerAuthMap: {}, // Map player.id -> { auth, name } (room.getPlayerList() doesn't include auth)
             finalScores: null, // Saved from onTeamVictory, null if draw/stopped early
@@ -84,32 +92,24 @@ async function initializeRoom(token = null) {
             }
         }
 
-        // Helper: Record ball touch/kick for assist tracking
-        function recordBallTouch(player) {
-            if (!gameState.isGameRunning) return;
-            if (player.team === 0) return; // Skip spectators
+        // Helper: Record an immutable ball-touch snapshot for goal attribution.
+        function recordBallTouch(player, source, position) {
+            if (!gameState.isGameRunning) return false;
+            if (player.team === 0) return false; // Skip spectators
 
-            const authData = gameState.playerAuthMap[player.id];
-            if (!authData) return; // Skip players without auth
-
-            const lastTouch = gameState.lastTouches[gameState.lastTouches.length - 1];
-
-            // Record if it's a different player or enough time has passed (150ms throttle for same player)
-            if (!lastTouch || lastTouch.playerId !== player.id || Date.now() - lastTouch.timestamp > 150) {
-                gameState.lastTouches.push({
-                    playerId: player.id,
-                    playerAuth: authData.auth,
-                    playerName: player.name,
-                    playerTeam: player.team,
-                    timestamp: Date.now(),
-                });
-
-                // Keep last 10 touches (enough for deflections + assist detection)
-                // We need more than 2 to handle deflections properly
-                if (gameState.lastTouches.length > 10) {
-                    gameState.lastTouches.shift();
-                }
-            }
+            const authData = gameState.playerAuthMap[player.id] || {};
+            const ballPosition = position || room.getBallPosition();
+            const scores = room.getScores();
+            return goalAttribution.recordTouch({
+                playerId: player.id,
+                playerAuth: authData.auth || null,
+                playerName: player.name,
+                playerTeam: player.team,
+                timestamp: Date.now(),
+                matchTime: scores?.time ?? null,
+                position: ballPosition ? { x: ballPosition.x, y: ballPosition.y } : null,
+                source,
+            });
         }
 
         // Player join
@@ -149,7 +149,7 @@ async function initializeRoom(token = null) {
         // Game start
         room.onGameStart = (byPlayer) => {
             gameState.isGameRunning = true;
-            gameState.lastTouches = [];
+            goalAttribution.resetMatch();
             gameState.matchGoals = {};
             gameState.finalScores = { red: 0, blue: 0 }; // Initialize to 0:0 for draw tracking
 
@@ -201,6 +201,7 @@ async function initializeRoom(token = null) {
         room.onGameStop = (byPlayer) => {
             if (!gameState.isGameRunning) return;
             gameState.isGameRunning = false;
+            goalAttribution.resetPlay();
 
             console.log(`[Stats] [2/2] onGameStop fired - finalScores available: ${!!gameState.finalScores}`);
 
@@ -279,64 +280,16 @@ async function initializeRoom(token = null) {
 
         // Team goal
         room.onTeamGoal = (team) => {
-            // Find scorer - look for last touch by scoring team (ignore deflections)
-            let scorer = null;
-            let assister = null;
+            const attribution = goalAttribution.resolveGoal({ scoringTeam: team, timestamp: Date.now() });
+            const scorer = attribution.scorer;
+            const assister = attribution.assister;
+            const isOwnGoal = attribution.isOwnGoal;
 
-            if (gameState.lastTouches.length > 0) {
-                const now = Date.now();
-
-                // Find all touches from the scoring team within the time window
-                const scoringTeamTouches = gameState.lastTouches.filter(touch =>
-                    touch.playerTeam === team && (now - touch.timestamp) <= ASSIST_TIME_WINDOW
-                );
-
-                if (scoringTeamTouches.length > 0) {
-                    // Last touch from scoring team is the scorer
-                    const lastScoringTouch = scoringTeamTouches[scoringTeamTouches.length - 1];
-                    scorer = {
-                        auth: lastScoringTouch.playerAuth,
-                        name: lastScoringTouch.playerName,
-                        team: lastScoringTouch.playerTeam,
-                    };
-
-                    // Find assister (second-to-last touch from scoring team, different player)
-                    if (scoringTeamTouches.length > 1) {
-                        const secondLastScoringTouch = scoringTeamTouches[scoringTeamTouches.length - 2];
-                        const timeDiff = now - secondLastScoringTouch.timestamp;
-                        const isSamePlayer = secondLastScoringTouch.playerId === lastScoringTouch.playerId;
-
-                        if (timeDiff <= ASSIST_TIME_WINDOW && !isSamePlayer) {
-                            assister = {
-                                auth: secondLastScoringTouch.playerAuth,
-                                name: secondLastScoringTouch.playerName,
-                            };
-                        }
-                    }
-                } else {
-                    // No touch from scoring team - check if it's an own goal
-                    const lastTouch = gameState.lastTouches[gameState.lastTouches.length - 1];
-                    if (lastTouch.playerTeam !== team) {
-                        scorer = {
-                            auth: lastTouch.playerAuth,
-                            name: lastTouch.playerName,
-                            team: lastTouch.playerTeam,
-                        };
-                        console.log('[Stats] Own goal detected: ' + scorer.name + ' (team ' + scorer.team + ') scored for team ' + team);
-                    } else {
-                        console.log('[Stats] Warning: No valid touches found for goal (team: ' + team + ')');
-                    }
-                }
-            } else {
-                console.log('[Stats] Warning: No ball touches recorded before goal (team: ' + team + ')');
-            }
-
-            // Track goals for match summary
-            const isOwnGoal = scorer && scorer.team !== team;
-            if (scorer && !isOwnGoal && gameState.matchGoals[scorer.auth]) {
+            // Track goals for match summary only for stable auth identities.
+            if (scorer?.auth && !isOwnGoal && gameState.matchGoals[scorer.auth]) {
                 gameState.matchGoals[scorer.auth].goals++;
             }
-            if (assister && gameState.matchGoals[assister.auth]) {
+            if (assister?.auth && gameState.matchGoals[assister.auth]) {
                 gameState.matchGoals[assister.auth].assists++;
             }
 
@@ -348,20 +301,25 @@ async function initializeRoom(token = null) {
             const scoreText = scores ? `🔴 Red ${scores.red} - ${scores.blue} Blue 🔵` : 'Score unavailable';
 
             // Announcement: Goal
-            if (isOwnGoal) {
+            if (isOwnGoal && scorer) {
                 room.sendAnnouncement(`😱 SAMOBÓJ! ${scorer.name}`, null, 0xFFFFFF, 'bold', 2);
             } else if (scorer) {
                 let goalText = `⚽ GOOOL! ${scorer.name}`;
-                if (assister && !assister.isSelf) {
+                if (assister) {
                     goalText += ` - asysta: ${assister.name}`;
                 }
                 room.sendAnnouncement(goalText, null, 0xFFFFFF, 'bold', 2);
+            } else {
+                room.sendAnnouncement('⚽ GOOOL! Nie udało się ustalić strzelca', null, 0xFFFFFF, 'bold', 2);
             }
             room.sendAnnouncement(scoreText, null, 0xFFFFFF, 'normal', 1);
 
             if (window.statsOnTeamGoal) {
                 window.statsOnTeamGoal(team, scorer, assister);
             }
+
+            // Do not reset before resolving the goal; reset after so the next play starts clean.
+            goalAttribution.resetPlay();
         };
 
         // Team victory - save final scores
@@ -373,7 +331,7 @@ async function initializeRoom(token = null) {
 
         // Player ball kick - track kicks (passes, shots)
         room.onPlayerBallKick = (player) => {
-            recordBallTouch(player);
+            recordBallTouch(player, 'kick');
         };
 
         // Game tick - track ball touches (deflections, dribbling)
@@ -381,35 +339,35 @@ async function initializeRoom(token = null) {
             if (!gameState.isGameRunning) return;
 
             const ballPosition = room.getBallPosition();
-            const players = room.getPlayerList();
-            const touchRadius = 15 + 10; // player radius + ball radius
+            const ballDisc = room.getDiscProperties(0);
+            const ballRadius = ballDisc?.radius;
+            const timestamp = Date.now();
+            const players = room.getPlayerList()
+                .filter(player => player.team !== 0)
+                .map(player => {
+                    const disc = room.getPlayerDiscProperties(player.id);
+                    return {
+                        ...player,
+                        disc,
+                        playerRadius: disc?.radius,
+                    };
+                });
 
-            // Find the closest player touching the ball
-            let closestPlayer = null;
-            let closestDistance = touchRadius;
+            const contact = goalAttribution.selectClosestContact({
+                ballPosition,
+                ballRadius,
+                players,
+                timestamp,
+            });
 
-            for (const player of players) {
-                if (player.team === 0) continue; // Skip spectators
-
-                const playerDisc = room.getPlayerDiscProperties(player.id);
-                if (!playerDisc) continue;
-
-                // Calculate distance between player and ball
-                const dx = playerDisc.x - ballPosition.x;
-                const dy = playerDisc.y - ballPosition.y;
-                const distance = Math.sqrt(dx * dx + dy * dy);
-
-                // Track closest player within touch radius
-                if (distance < closestDistance) {
-                    closestDistance = distance;
-                    closestPlayer = player;
-                }
+            if (contact?.player) {
+                recordBallTouch(contact.player, 'proximity', ballPosition);
             }
+        };
 
-            // Record touch for the closest player only
-            if (closestPlayer) {
-                recordBallTouch(closestPlayer);
-            }
+        // Positions reset after a goal or manual reset: start fresh for the next play.
+        room.onPositionsReset = () => {
+            goalAttribution.resetPlay();
         };
 
         // Player chat - handle commands
@@ -444,7 +402,10 @@ async function initializeRoom(token = null) {
 
             return true;
         };
-    }, roomConfig);
+    }, {
+        config: roomConfig,
+        goalAttributionFactorySource,
+    });
 
     updateState({ status_message: 'Room script executed. Waiting for room link...' });
 }
