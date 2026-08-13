@@ -2,15 +2,21 @@ export function createGoalAttributionEngine(options = {}) {
     const DEFAULTS = {
         assistTimeWindowMs: 3000,
         maxGoalTouchAgeMs: 3000,
-        samePlayerTouchThrottleMs: 700,
         proximityAfterKickSuppressMs: 250,
-        maxTouches: 30,
         contactTolerance: 0.5,
         tieDistanceTolerance: 0.01,
         diagnostics: false,
     };
     const config = { ...DEFAULTS, ...options };
-    let touches = [];
+
+    // This is deliberately a pair, rather than a chronological event log. It
+    // represents the current ball owner and the player who touched it before
+    // that owner. Consecutive contacts from one player enrich currentTouch but
+    // never create a new attribution candidate. The tiny team index is only
+    // used to recover the attacker through a run of proximity deflections.
+    let currentTouch = null;
+    let previousDifferentTouch = null;
+    let latestTouchByTeam = new Map();
     let lastKickPlayerId = null;
     let lastKickTimestamp = 0;
 
@@ -21,6 +27,7 @@ export function createGoalAttributionEngine(options = {}) {
     };
 
     const samePlayer = (a, b) => a && b && a.playerId === b.playerId;
+    const isRecent = (touch, timestamp) => touch && timestamp - touch.timestamp <= config.maxGoalTouchAgeMs;
     const publicPlayer = (touch) => touch ? ({
         id: touch.playerId,
         auth: touch.playerAuth || null,
@@ -36,95 +43,140 @@ export function createGoalAttributionEngine(options = {}) {
         timestamp: touch.timestamp,
         matchTime: touch.matchTime ?? null,
         position: touch.position ? { x: touch.position.x, y: touch.position.y } : null,
-        source: touch.source || 'proximity',
+        source: touch.source === 'kick' ? 'kick' : 'proximity',
     });
 
-    function mergeLastTouch(touch) {
-        const last = touches[touches.length - 1];
-        touches[touches.length - 1] = { ...last, ...touch };
-        debug('touch-updated', touches[touches.length - 1]);
-    }
-
-    function shouldRecord(touch) {
-        const last = touches[touches.length - 1];
-        if (!last) return { action: 'append' };
-        if (!samePlayer(last, touch)) return { action: 'append' };
-
-        const elapsed = touch.timestamp - last.timestamp;
-        if (touch.source === 'proximity' && last.source === 'kick' && elapsed <= config.proximityAfterKickSuppressMs) {
-            return { action: 'ignore' };
-        }
-        if (touch.source === 'kick' && last.source === 'proximity') {
-            return { action: 'replace-last' };
-        }
-        if (elapsed >= config.samePlayerTouchThrottleMs) {
-            return { action: 'append' };
-        }
-        return { action: 'ignore' };
+    function mergeCurrentTouch(touch) {
+        // A kick is stronger evidence than proximity and must never be
+        // downgraded by a later proximity sample from the same player.
+        currentTouch = {
+            ...currentTouch,
+            ...touch,
+            source: currentTouch.source === 'kick' || touch.source === 'kick' ? 'kick' : 'proximity',
+        };
+        latestTouchByTeam.set(currentTouch.playerTeam, currentTouch);
+        debug('touch-updated', currentTouch);
     }
 
     function recordTouch(touch) {
         if (!touch || touch.playerTeam === 0 || touch.playerId == null || touch.timestamp == null) return false;
+
         const normalized = normalizeTouch(touch);
         if (normalized.source === 'kick') {
             lastKickPlayerId = normalized.playerId;
             lastKickTimestamp = normalized.timestamp;
         }
-        const decision = shouldRecord(normalized);
-        if (decision.action === 'ignore') return false;
-        if (decision.action === 'replace-last') {
-            mergeLastTouch(normalized);
+
+        if (samePlayer(currentTouch, normalized)) {
+            mergeCurrentTouch(normalized);
             return true;
         }
-        touches.push(normalized);
-        if (touches.length > config.maxTouches) touches = touches.slice(-config.maxTouches);
-        debug('touch', normalized);
+
+        previousDifferentTouch = currentTouch;
+        currentTouch = normalized;
+        latestTouchByTeam.set(currentTouch.playerTeam, currentTouch);
+        debug('touch', currentTouch, 'previous', previousDifferentTouch);
         return true;
     }
 
-    function findAssist(scorerTouch, scorerIndex, scoringTeam) {
-        let blockedByOpponent = false;
-        for (let i = scorerIndex - 1; i >= 0; i--) {
-            const touch = touches[i];
-            if (samePlayer(touch, scorerTouch)) continue;
-            if (touch.playerTeam !== scoringTeam) {
-                blockedByOpponent = true;
-                break;
-            }
-            const passToScorerTime = scorerTouch.timestamp - touch.timestamp;
-            if (passToScorerTime > config.assistTimeWindowMs) {
-                return { assister: null, reason: 'assist-expired' };
-            }
-            return { assister: publicPlayer(touch), reason: 'assist-found' };
+    function resolveAssist(scorerTouch, scoringTeam) {
+        const candidate = previousDifferentTouch;
+        if (!candidate) return { assister: null, reason: 'no-assist-candidate' };
+        if (candidate.playerTeam !== scoringTeam) return { assister: null, reason: 'assist-blocked-by-opponent' };
+        if (samePlayer(candidate, scorerTouch)) return { assister: null, reason: 'no-assist-candidate' };
+
+        if (scorerTouch.timestamp - candidate.timestamp > config.assistTimeWindowMs) {
+            return { assister: null, reason: 'assist-expired' };
         }
-        return { assister: null, reason: blockedByOpponent ? 'assist-blocked-by-opponent' : 'no-assist-candidate' };
+        return { assister: publicPlayer(candidate), reason: 'assist-found' };
+    }
+
+    function unknownGoal() {
+        return {
+            type: 'unknown',
+            scorer: null,
+            assister: null,
+            isOwnGoal: false,
+            confidence: 'low',
+            reason: 'no-recent-scoring-touch',
+            assistReason: null,
+        };
     }
 
     function resolveGoal({ scoringTeam, timestamp }) {
-        const goalTimestamp = timestamp;
-        const lastIndex = touches.length - 1;
-        const lastTouch = touches[lastIndex];
-        if (!lastTouch || goalTimestamp - lastTouch.timestamp > config.maxGoalTouchAgeMs) {
-            const result = { type: 'unknown', scorer: null, assister: null, isOwnGoal: false, confidence: 'low', reason: 'no-recent-touch', assistReason: null };
-            debug('goal', result, touches.slice(-6));
+        if (!isRecent(currentTouch, timestamp)) {
+            const result = unknownGoal();
+            debug('goal', result, getTouches());
             return result;
         }
 
-        if (lastTouch.playerTeam !== scoringTeam) {
-            const result = { type: 'own_goal', scorer: publicPlayer(lastTouch), assister: null, isOwnGoal: true, confidence: 'high', reason: 'last-touch-opponent', assistReason: null };
-            debug('goal', result, touches.slice(-6));
+        if (currentTouch.playerTeam === scoringTeam) {
+            const assist = resolveAssist(currentTouch, scoringTeam);
+            const result = {
+                type: 'goal',
+                scorer: publicPlayer(currentTouch),
+                assister: assist.assister,
+                isOwnGoal: false,
+                confidence: 'high',
+                reason: 'last-touch-scoring-team',
+                assistReason: assist.reason,
+            };
+            debug('goal', result, getTouches());
             return result;
         }
 
-        const assist = findAssist(lastTouch, lastIndex, scoringTeam);
-        const result = { type: 'goal', scorer: publicPlayer(lastTouch), assister: assist.assister, isOwnGoal: false, confidence: 'high', reason: 'last-touch-scoring-team', assistReason: assist.reason };
-        debug('goal', result, touches.slice(-6));
+        if (currentTouch.source === 'kick') {
+            const result = {
+                type: 'own_goal',
+                scorer: publicPlayer(currentTouch),
+                assister: null,
+                isOwnGoal: true,
+                confidence: 'high',
+                reason: 'opponent-kick-own-goal',
+                assistReason: null,
+            };
+            debug('goal', result, getTouches());
+            return result;
+        }
+
+        // Proximity alone is not enough evidence for an own goal. Recover the
+        // latest recent scoring-team touch, while keeping the defender contact
+        // as an assist boundary.
+        const scoringTouch = latestTouchByTeam.get(scoringTeam);
+        if (scoringTouch && isRecent(scoringTouch, timestamp)) {
+            const result = {
+                type: 'goal',
+                scorer: publicPlayer(scoringTouch),
+                assister: null,
+                isOwnGoal: false,
+                confidence: 'medium',
+                reason: 'opponent-proximity-deflection',
+                assistReason: 'assist-blocked-by-opponent',
+            };
+            debug('goal', result, getTouches());
+            return result;
+        }
+
+        const result = unknownGoal();
+        debug('goal', result, getTouches());
         return result;
     }
 
-    function resetPlay() { touches = []; lastKickPlayerId = null; lastKickTimestamp = 0; }
+    function resetPlay() {
+        currentTouch = null;
+        previousDifferentTouch = null;
+        latestTouchByTeam = new Map();
+        lastKickPlayerId = null;
+        lastKickTimestamp = 0;
+    }
+
     function resetMatch() { resetPlay(); }
-    function getTouches() { return touches.map(t => ({ ...t, position: t.position ? { ...t.position } : null })); }
+
+    function getTouches() {
+        return [previousDifferentTouch, currentTouch]
+            .filter(Boolean)
+            .map(touch => ({ ...touch, position: touch.position ? { ...touch.position } : null }));
+    }
 
     function selectClosestContact({ ballPosition, ballRadius, players, timestamp }) {
         if (!ballPosition || !Number.isFinite(ballRadius) || !Array.isArray(players)) return null;
