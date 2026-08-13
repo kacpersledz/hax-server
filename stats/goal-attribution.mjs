@@ -2,6 +2,7 @@ export function createGoalAttributionEngine(options = {}) {
     const DEFAULTS = {
         assistTimeWindowMs: 3000,
         maxGoalTouchAgeMs: 3000,
+        ownGoalKickMaxAgeMs: 750,
         proximityAfterKickSuppressMs: 250,
         contactTolerance: 0.5,
         tieDistanceTolerance: 0.01,
@@ -27,7 +28,10 @@ export function createGoalAttributionEngine(options = {}) {
     };
 
     const samePlayer = (a, b) => a && b && a.playerId === b.playerId;
-    const isRecent = (touch, timestamp) => touch && timestamp - touch.timestamp <= config.maxGoalTouchAgeMs;
+    const isRecent = (touch, timestamp) => touch && timestamp - touch.lastTouchTimestamp >= 0 &&
+        timestamp - touch.lastTouchTimestamp <= config.maxGoalTouchAgeMs;
+    const hasRecentKick = (touch, timestamp) => touch && touch.lastKickTimestamp != null &&
+        timestamp - touch.lastKickTimestamp >= 0 && timestamp - touch.lastKickTimestamp <= config.ownGoalKickMaxAgeMs;
     const publicPlayer = (touch) => touch ? ({
         id: touch.playerId,
         auth: touch.playerAuth || null,
@@ -46,12 +50,29 @@ export function createGoalAttributionEngine(options = {}) {
         source: touch.source === 'kick' ? 'kick' : 'proximity',
     });
 
+    function createLogicalTouch(touch) {
+        return {
+            ...touch,
+            // `timestamp` remains a diagnostic compatibility alias for the
+            // latest physical contact. Goal recency must use the explicit
+            // field so it cannot be confused with the kick or takeover time.
+            firstTouchTimestamp: touch.timestamp,
+            lastTouchTimestamp: touch.timestamp,
+            lastKickTimestamp: touch.source === 'kick' ? touch.timestamp : null,
+        };
+    }
+
     function mergeCurrentTouch(touch) {
         // A kick is stronger evidence than proximity and must never be
-        // downgraded by a later proximity sample from the same player.
+        // downgraded by a later proximity sample from the same player. Its
+        // time is tracked independently so that kick evidence cannot be
+        // refreshed by subsequent proximity contacts.
         currentTouch = {
             ...currentTouch,
             ...touch,
+            firstTouchTimestamp: currentTouch.firstTouchTimestamp,
+            lastTouchTimestamp: touch.timestamp,
+            lastKickTimestamp: touch.source === 'kick' ? touch.timestamp : currentTouch.lastKickTimestamp,
             source: currentTouch.source === 'kick' || touch.source === 'kick' ? 'kick' : 'proximity',
         };
         latestTouchByTeam.set(currentTouch.playerTeam, currentTouch);
@@ -73,7 +94,7 @@ export function createGoalAttributionEngine(options = {}) {
         }
 
         previousDifferentTouch = currentTouch;
-        currentTouch = normalized;
+        currentTouch = createLogicalTouch(normalized);
         latestTouchByTeam.set(currentTouch.playerTeam, currentTouch);
         debug('touch', currentTouch, 'previous', previousDifferentTouch);
         return true;
@@ -85,7 +106,7 @@ export function createGoalAttributionEngine(options = {}) {
         if (candidate.playerTeam !== scoringTeam) return { assister: null, reason: 'assist-blocked-by-opponent' };
         if (samePlayer(candidate, scorerTouch)) return { assister: null, reason: 'no-assist-candidate' };
 
-        if (scorerTouch.timestamp - candidate.timestamp > config.assistTimeWindowMs) {
+        if (scorerTouch.firstTouchTimestamp - candidate.lastTouchTimestamp > config.assistTimeWindowMs) {
             return { assister: null, reason: 'assist-expired' };
         }
         return { assister: publicPlayer(candidate), reason: 'assist-found' };
@@ -125,7 +146,7 @@ export function createGoalAttributionEngine(options = {}) {
             return result;
         }
 
-        if (currentTouch.source === 'kick') {
+        if (hasRecentKick(currentTouch, timestamp)) {
             const result = {
                 type: 'own_goal',
                 scorer: publicPlayer(currentTouch),

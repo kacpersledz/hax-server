@@ -58,6 +58,21 @@ test('repeated scorer touches do not destroy an assist', () => {
     assert.equal(e.getTouches().length, 2);
 });
 
+test('a long scorer dribble preserves the assist from the takeover transition', () => {
+    const e = engine({ assistTimeWindowMs: 3000 });
+    e.recordTouch(touch(P.A, 1000));
+    e.recordTouch(touch(P.B, 1500));
+    e.recordTouch(touch(P.B, 2200, 'proximity'));
+    e.recordTouch(touch(P.B, 3000, 'proximity'));
+    e.recordTouch(touch(P.B, 4000, 'proximity'));
+    e.recordTouch(touch(P.B, 4050, 'proximity'));
+    const result = e.resolveGoal({ scoringTeam: RED, timestamp: 4100 });
+
+    assert.equal(result.scorer.name, 'B');
+    assert.equal(result.assister.name, 'A');
+    assert.equal(result.assistReason, 'assist-found');
+});
+
 test('does not award a self-assist', () => {
     const e = engine();
     e.recordTouch(touch(P.B, 1000));
@@ -108,17 +123,45 @@ test('a run of defender-only proximity deflections still preserves the recent at
     assert.equal(result.isOwnGoal, false);
 });
 
-test('attacker then defender kick is a defender own goal', () => {
+test('a recent defender kick is a defender own goal', () => {
     const e = engine();
-    e.recordTouch(touch(P.A, 1000));
-    e.recordTouch(touch(P.D, 1200));
-    const result = e.resolveGoal({ scoringTeam: RED, timestamp: 1400 });
+    e.recordTouch(touch(P.A, 900));
+    e.recordTouch(touch(P.D, 1800));
+    const result = e.resolveGoal({ scoringTeam: RED, timestamp: 1900 });
 
     assert.equal(result.type, 'own_goal');
     assert.equal(result.scorer.name, 'D');
     assert.equal(result.assister, null);
     assert.equal(result.isOwnGoal, true);
     assert.equal(result.reason, 'opponent-kick-own-goal');
+});
+
+test('an old defender kick is not refreshed by a later proximity contact', () => {
+    const e = engine();
+    e.recordTouch(touch(P.D, 1000, 'kick'));
+    e.recordTouch(touch(P.D, 1800, 'proximity'));
+    const result = e.resolveGoal({ scoringTeam: RED, timestamp: 1900 });
+    const [defenderTouch] = e.getTouches();
+
+    assert.equal(result.type, 'unknown');
+    assert.equal(result.isOwnGoal, false);
+    assert.equal(defenderTouch.firstTouchTimestamp, 1000);
+    assert.equal(defenderTouch.lastTouchTimestamp, 1800);
+    assert.equal(defenderTouch.lastKickTimestamp, 1000);
+});
+
+test('an old defender kick followed by proximity remains a deflection when a recent attacker exists', () => {
+    const e = engine();
+    e.recordTouch(touch(P.A, 900, 'kick'));
+    e.recordTouch(touch(P.D, 1000, 'kick'));
+    e.recordTouch(touch(P.D, 1800, 'proximity'));
+    const result = e.resolveGoal({ scoringTeam: RED, timestamp: 1900 });
+
+    assert.equal(result.type, 'goal');
+    assert.equal(result.scorer.name, 'A');
+    assert.equal(result.assister, null);
+    assert.equal(result.isOwnGoal, false);
+    assert.equal(result.reason, 'opponent-proximity-deflection');
 });
 
 test('an opponent touch blocks an assist', () => {
@@ -142,17 +185,24 @@ test('proximity followed by a kick upgrades the current logical touch to kick', 
     assert.equal(touches.length, 1);
     assert.equal(touches[0].source, 'kick');
     assert.equal(touches[0].timestamp, 1050);
+    assert.equal(touches[0].firstTouchTimestamp, 1000);
+    assert.equal(touches[0].lastTouchTimestamp, 1050);
+    assert.equal(touches[0].lastKickTimestamp, 1050);
 });
 
-test('a proximity contact after a kick does not downgrade the current touch', () => {
+test('same-player proximity, kick, and proximity keep independent logical timing', () => {
     const e = engine();
-    e.recordTouch(touch(P.A, 1000, 'kick'));
-    e.recordTouch(touch(P.A, 1050, 'proximity'));
+    e.recordTouch(touch(P.A, 1000, 'proximity'));
+    e.recordTouch(touch(P.A, 1050, 'kick'));
+    e.recordTouch(touch(P.A, 1100, 'proximity'));
     const touches = e.getTouches();
 
     assert.equal(touches.length, 1);
     assert.equal(touches[0].source, 'kick');
-    assert.equal(touches[0].timestamp, 1050);
+    assert.equal(touches[0].firstTouchTimestamp, 1000);
+    assert.equal(touches[0].lastTouchTimestamp, 1100);
+    assert.equal(touches[0].lastKickTimestamp, 1050);
+    assert.equal(touches[0].timestamp, 1100);
 });
 
 test('repeated same-player proximity contacts do not pollute the logical sequence', () => {
