@@ -1,4 +1,5 @@
 import { chromium } from "playwright";
+import { readFile } from "node:fs/promises";
 import { HaxballStatsTracker } from "./stats/index.mjs";
 import { createGoalAttributionEngine } from "./stats/goal-attribution.mjs";
 
@@ -60,12 +61,19 @@ async function initializeRoom(token = null) {
         token: token, // Pass the token here
     };
 
+    let stadiumSource;
+    try {
+        stadiumSource = await readFile(new URL('./stadiums/rounded-fast.hbs', import.meta.url), 'utf8');
+    } catch (error) {
+        throw new Error(`Failed to load Rounded Fast stadium (stadiums/rounded-fast.hbs): ${error.message}`, { cause: error });
+    }
+
     const goalAttributionFactorySource = `(${createGoalAttributionEngine.toString()})`;
 
-    await state.page.evaluate(({ config, goalAttributionFactorySource }) => {
+    await state.page.evaluate(({ config, goalAttributionFactorySource, stadiumSource }) => {
         const room = window.HBInit(config);
         const createGoalAttributionEngine = eval(goalAttributionFactorySource);
-        room.setDefaultStadium("Rounded");
+        room.setCustomStadium(stadiumSource);
         room.setScoreLimit(0);
         room.setTimeLimit(3);
         room.onRoomLink = (url) => window.onRoomLinkSet(url);
@@ -405,6 +413,7 @@ async function initializeRoom(token = null) {
     }, {
         config: roomConfig,
         goalAttributionFactorySource,
+        stadiumSource,
     });
 
     updateState({ status_message: 'Room script executed. Waiting for room link...' });
