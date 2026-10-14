@@ -65,7 +65,7 @@ async function initializeRoom(token = null) {
     try {
         stadiumSource = await readFile(new URL('./stadiums/rounded-fast.hbs', import.meta.url), 'utf8');
     } catch (error) {
-        throw new Error(`Failed to load Rounded Fast stadium (stadiums/rounded-fast.hbs): ${error.message}`, { cause: error });
+        throw new Error(`Failed to load AAAAuto Arena stadium (stadiums/rounded-fast.hbs): ${error.message}`, { cause: error });
     }
 
     const goalAttributionFactorySource = `(${createGoalAttributionEngine.toString()})`;

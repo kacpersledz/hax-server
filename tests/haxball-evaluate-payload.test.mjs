@@ -35,9 +35,9 @@ function initializeWith(page, readStadium = readFile, window = {}) {
     return vm.runInContext(`${initializationSource}\ninitializeRoom('test-token')`, context);
 }
 
-test('Rounded Fast file retains the supplied dimensions and faster kick physics', () => {
+test('AAAAuto Arena file retains the supplied dimensions and faster kick physics', () => {
     const stadium = JSON.parse(stadiumSource);
-    assert.equal(stadium.name, 'Rounded Fast');
+    assert.equal(stadium.name, 'AAAAuto Arena');
     assert.equal(stadium.width, 420);
     assert.equal(stadium.height, 200);
     assert.deepEqual(stadium.playerPhysics, { kickStrength: 6.5 });
@@ -87,7 +87,7 @@ test('stadium read failure reports the map and file and prevents room initializa
         async exposeFunction() {},
         async evaluate() { assert.fail('Room must not initialize without its stadium'); },
     }, async () => { throw cause; }), error => {
-        assert.match(error.message, /Failed to load Rounded Fast stadium \(stadiums\/rounded-fast\.hbs\): ENOENT/);
+        assert.match(error.message, /Failed to load AAAAuto Arena stadium \(stadiums\/rounded-fast\.hbs\): ENOENT/);
         assert.equal(error.cause, cause);
         return true;
     });
