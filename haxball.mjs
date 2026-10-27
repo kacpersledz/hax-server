@@ -134,7 +134,12 @@ async function initializeRoom(token = null) {
             getPhysics: getStadiumPhysics,
             isGameRunning: () => gameState.isGameRunning || room.getScores?.() != null,
         });
-        room.setCustomStadium(stadiumSource);
+        // Install the callback before the initial asynchronous setter so the
+        // randomizer can confirm the room's starting stadium before commands.
+        room.onStadiumChange = (newStadiumName, byPlayer) => {
+            stadiumRandomizer.onStadiumChange(newStadiumName, byPlayer);
+        };
+        stadiumRandomizer.initializeStadium();
         room.setScoreLimit(0);
         room.setTimeLimit(3);
         room.onRoomLink = (url) => window.onRoomLinkSet(url);
@@ -265,12 +270,6 @@ async function initializeRoom(token = null) {
             if (window.statsOnGameStart) {
                 window.statsOnGameStart(players);
             }
-        };
-
-        // Keep the base template in sync with manual stadium-picker selections.
-        // Programmatic changes have byPlayer === null and preserve our base map.
-        room.onStadiumChange = (newStadiumName, byPlayer) => {
-            stadiumRandomizer.onStadiumChange(newStadiumName, byPlayer);
         };
 
         // Game stop

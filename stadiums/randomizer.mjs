@@ -117,8 +117,10 @@ export function createStadiumRandomizer({
     const customName = 'AAAAuto Arena';
     let selected = { name: customName, source: customStadiumSource, type: 'custom' };
     let randomizedPhysics = null;
+    let physicsStatus = 'unknown';
+    let stadiumIdentityKnown = false;
     let pending = null;
-    let unconfirmedReason = null;
+    let unconfirmedReason = 'Initial stadium selection has not been confirmed.';
     // Events carry no operation id. Remember cancelled targets so an
     // indistinguishable late event cannot satisfy a later identical request.
     const abandonedTargets = new Set();
@@ -157,12 +159,24 @@ export function createStadiumRandomizer({
         pending = null;
         if (confirmed) {
             randomizedPhysics = operation.kind === 'randomize' ? operation.physics : null;
+            physicsStatus = operation.kind === 'randomize' ? 'randomized' : 'original';
+            if (operation.identityAffecting) stadiumIdentityKnown = true;
             unconfirmedReason = null;
             abandonedTargets.delete(operation.key);
         } else if (uncertain) {
+            randomizedPhysics = null;
+            physicsStatus = 'unknown';
+            if (operation.identityAffecting) stadiumIdentityKnown = false;
             unconfirmedReason = 'A stadium setter may have taken effect without a matching confirmation.';
             abandonedTargets.add(operation.key);
             abandonedNames.add(operation.expectedName);
+        } else {
+            // A synchronous setter exception still leaves the room-side state
+            // uncertain: Headless API setters provide no resulting state value.
+            randomizedPhysics = null;
+            physicsStatus = 'unknown';
+            if (operation.identityAffecting) stadiumIdentityKnown = false;
+            unconfirmedReason = 'The stadium setter failed; physics state is unconfirmed.';
         }
         operation.resolve(message);
     }
@@ -206,8 +220,8 @@ export function createStadiumRandomizer({
     }
 
     function resolveSelectedPhysics() {
-        if (randomizedPhysics) return randomizedPhysics;
-        if (selected.source) return getPhysics(selected.source);
+        if (physicsStatus === 'randomized' && randomizedPhysics) return randomizedPhysics;
+        if (physicsStatus === 'original' && selected.source) return getPhysics(selected.source);
         return {
             kickStrength: null,
             kickMultiplier: null,
@@ -221,19 +235,21 @@ export function createStadiumRandomizer({
             ? 'unknown'
             : `${physics.kickMultiplier.toFixed(2)}x`;
         const damping = physics.damping === null ? 'unknown' : String(physics.damping);
-        const status = randomizedPhysics ? 'randomized' : 'original';
+        const status = physicsStatus === 'unknown' ? 'unknown / unconfirmed' : physicsStatus;
+        const stadiumLabel = stadiumIdentityKnown ? selected.name : `${selected.name} (last selected; current stadium unknown)`;
         const confirmation = pending
             ? '\n⏳ Waiting for stadium confirmation.'
-            : unconfirmedReason
-                ? `\n⚠️ ${unconfirmedReason}`
+            : !stadiumIdentityKnown || unconfirmedReason
+                ? `\n⚠️ ${unconfirmedReason || 'Stadium identity or physics are unconfirmed. Manually select a supported stadium to resynchronize.'}`
                 : '';
-        return `🏟 ${selected.name}\n⚽ Kick: ${kick}\n🛑 Damping: ${damping}\n🎲 Physics: ${status}${confirmation}`;
+        return `🏟 ${stadiumLabel}\n⚽ Kick: ${kick}\n🛑 Damping: ${damping}\n🎲 Physics: ${status}${confirmation}`;
     }
 
     function onStadiumChange(newStadiumName, byPlayer) {
         // A player event always wins over a pending setter and becomes the new
         // base template. Its event is also the confirmation of the manual map.
         if (byPlayer != null) {
+            const hadPending = pending !== null;
             cancelPending('⚠️ Stadium request canceled because a player changed the stadium before confirmation.', { uncertain: true });
 
             const source = builtins.get(newStadiumName);
@@ -245,19 +261,46 @@ export function createStadiumRandomizer({
                 selected = { name: newStadiumName || 'Unknown custom stadium', source: null, type: 'unsupported' };
             }
             randomizedPhysics = null;
-            unconfirmedReason = null;
+            if (hadPending) {
+                // The player selection is known at this instant, but the
+                // canceled asynchronous setter could still apply afterward.
+                stadiumIdentityKnown = false;
+                physicsStatus = 'unknown';
+                unconfirmedReason = 'A canceled stadium change may still apply. Manually select a supported stadium again after it settles.';
+            } else if (abandonedNames.size > 0) {
+                stadiumIdentityKnown = false;
+                physicsStatus = 'unknown';
+                unconfirmedReason = 'A canceled programmatic change may still apply. Wait for its callback, then manually select a supported stadium to resynchronize.';
+            } else {
+                stadiumIdentityKnown = true;
+                physicsStatus = selected.type === 'unsupported' ? 'unknown' : 'original';
+                unconfirmedReason = selected.type === 'unsupported'
+                    ? 'Physics are unknown for this custom stadium.'
+                    : null;
+            }
             return;
         }
 
-        // Programmatic changes without a live request may be late callbacks
-        // from an operation that was cancelled. They must not change the base
-        // stadium selected by a player.
+        // A late callback can mean the actual room changed after cancellation.
+        // The API has no current-stadium getter, so retain the last manual base
+        // for display but block changes until a player selects a supported map.
         if (!pending) {
+            const wasAbandoned = abandonedNames.has(newStadiumName);
+            if (wasAbandoned || newStadiumName !== selected.name) {
+                stadiumIdentityKnown = false;
+                randomizedPhysics = null;
+                physicsStatus = 'unknown';
+                unconfirmedReason = `A programmatic stadium change to ${newStadiumName || 'an unknown stadium'} arrived without a matching request. Manually select a supported stadium to resynchronize.`;
+            }
             clearAbandonedTargets(newStadiumName);
             return;
         }
 
         if (newStadiumName !== pending.expectedName) {
+            const operation = pending;
+            finish(operation, `⚠️ Stadium changed to ${newStadiumName || 'an unknown stadium'} while a different change was pending. Manually select a supported stadium to resynchronize.`, { uncertain: true });
+            stadiumIdentityKnown = false;
+            unconfirmedReason = `Unexpected programmatic stadium change to ${newStadiumName || 'an unknown stadium'}; current stadium identity is unknown. Manually select a supported stadium to resynchronize.`;
             clearAbandonedTargets(newStadiumName);
             return;
         }
@@ -277,12 +320,10 @@ export function createStadiumRandomizer({
         checkConfirmation(pending);
     }
 
-    function beginOperation({ kind, source, expectedName, physics, setter, successMessage }) {
+    function beginOperation({ kind, source, expectedName, physics, setter, successMessage, identityAffecting = false }) {
         const beforeDamping = readBallDamping();
         const key = targetKey(expectedName, physics.damping);
-        if (abandonedTargets.has(key)
-            || (abandonedNames.has(expectedName)
-                && (beforeDamping === null || sameDamping(beforeDamping, physics.damping)))) {
+        if (kind !== 'reset' && abandonedTargets.has(key)) {
             return Promise.resolve(`❌ Cannot confirm this ${expectedName} change safely: an earlier request for this stadium may still emit an indistinguishable late event. Select another stadium or restart the room before retrying with the current damping.`);
         }
 
@@ -293,6 +334,7 @@ export function createStadiumRandomizer({
             source,
             expectedName,
             physics,
+            identityAffecting,
             key,
             beforeDamping,
             eventSeen: false,
@@ -326,11 +368,17 @@ export function createStadiumRandomizer({
         if (player?.admin !== true) return '❌ Only admins can change stadium physics.';
         if (isGameRunning()) return '⚠️ Stop the match before randomizing physics.';
         if (pending) return '⚠️ A stadium change is already awaiting confirmation.';
+        if (!stadiumIdentityKnown) {
+            return '⚠️ Current stadium identity is uncertain. Manually select a supported stadium to resynchronize before changing physics.';
+        }
         if (selected.type === 'unsupported') {
             return `❌ Cannot change physics for unsupported custom stadium: ${selected.name}.`;
         }
 
         if (action === 'reset') {
+            if (physicsStatus === 'original' && !unconfirmedReason) {
+                return '✅ Original physics already active.';
+            }
             const expectedPhysics = getPhysics(selected.source);
             try {
                 return beginOperation({
@@ -376,6 +424,18 @@ export function createStadiumRandomizer({
     return {
         handleCommand,
         onStadiumChange,
+        initializeStadium() {
+            const physics = getPhysics(customStadiumSource);
+            return beginOperation({
+                kind: 'reset',
+                source: customStadiumSource,
+                expectedName: customName,
+                physics,
+                identityAffecting: true,
+                setter: () => room.setCustomStadium(customStadiumSource),
+                successMessage: () => 'Initial stadium selection confirmed.',
+            });
+        },
         onGameStart() {
             cancelPending('⚠️ Match started before the stadium change was confirmed. No success was reported.', { uncertain: true });
         },
@@ -385,6 +445,8 @@ export function createStadiumRandomizer({
                 type: selected.type,
                 randomized: randomizedPhysics !== null,
                 physics: resolveSelectedPhysics(),
+                physicsStatus,
+                stadiumIdentityKnown,
                 pending: pending !== null,
                 unconfirmed: unconfirmedReason !== null,
             };

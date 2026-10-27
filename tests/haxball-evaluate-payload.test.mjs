@@ -78,6 +78,7 @@ test('initialization loads the module-relative stadium in Node and selects it be
             if (calls.length === 0) {
                 assert.equal(contents, stadiumSource);
                 assert.equal(this.onGameStart, undefined);
+                assert.equal(typeof this.onStadiumChange, 'function', 'initial setter is observed');
                 calls.push('stadium');
             } else {
                 calls.push({ type: 'custom', source: contents });
@@ -121,6 +122,8 @@ test('initialization loads the module-relative stadium in Node and selects it be
     assert.equal(typeof room.onGameStart, 'function');
     assert.equal(typeof room.onTeamGoal, 'function');
     assert.equal(typeof room.onStadiumChange, 'function');
+    assert.equal(typeof room.onPlayerChat, 'function');
+    room.onStadiumChange('AAAAuto Arena', null);
 
     assert.equal(room.onPlayerChat({ id: 7, admin: false }, '!r info'), false);
     await new Promise(resolve => setImmediate(resolve));
