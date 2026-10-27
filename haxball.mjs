@@ -1,7 +1,14 @@
 import { chromium } from "playwright";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { HaxballStatsTracker } from "./stats/index.mjs";
 import { createGoalAttributionEngine } from "./stats/goal-attribution.mjs";
+import {
+    BUILTIN_STADIUMS,
+    createStadiumRandomizer,
+    getStadiumPhysics,
+    randomizeStadiumDefinition,
+} from "./stadiums/randomizer.mjs";
 
 // The WebSocket endpoint for the existing Playwright server.
 const wsPath = process.env.WS_PATH;
@@ -27,6 +34,37 @@ function updateState(newState) {
     state = { ...state, ...newState };
     console.log(`[State Update] => ${state.status_message}`);
     onStateUpdate();
+}
+
+export async function loadBuiltinStadiums() {
+    return Promise.all(BUILTIN_STADIUMS.map(async ({ name, file, sourceSha }) => {
+        const url = new URL(`./stadiums/builtin/${file}`, import.meta.url);
+        let source;
+        try {
+            source = await readFile(url, 'utf8');
+        } catch (error) {
+            throw new Error(`Failed to load built-in stadium (${file}): ${error.message}`, { cause: error });
+        }
+
+        let definition;
+        try {
+            definition = JSON.parse(source);
+        } catch (error) {
+            throw new Error(`Invalid JSON in built-in stadium (${file}): ${error.message}`, { cause: error });
+        }
+        if (definition.name !== name) {
+            throw new Error(`Built-in stadium ${file} is named ${definition.name}, expected ${name}.`);
+        }
+
+        const blobSha = createHash('sha1')
+            .update(`blob ${Buffer.byteLength(source)}\0${source}`)
+            .digest('hex');
+        if (blobSha !== sourceSha) {
+            throw new Error(`Built-in stadium ${file} does not match its official source blob.`);
+        }
+
+        return { name, source };
+    }));
 }
 
 export function getRoomState() {
@@ -67,12 +105,35 @@ async function initializeRoom(token = null) {
     } catch (error) {
         throw new Error(`Failed to load AAAAuto Arena stadium (stadiums/rounded-fast.hbs): ${error.message}`, { cause: error });
     }
+    const builtinStadiums = await loadBuiltinStadiums();
 
     const goalAttributionFactorySource = `(${createGoalAttributionEngine.toString()})`;
+    const randomizerFactorySource = `(${createStadiumRandomizer.toString()})`;
+    const randomizeDefinitionSource = `(${randomizeStadiumDefinition.toString()})`;
+    const getPhysicsSource = `(${getStadiumPhysics.toString()})`;
 
-    await state.page.evaluate(({ config, goalAttributionFactorySource, stadiumSource }) => {
+    await state.page.evaluate(({
+        config,
+        goalAttributionFactorySource,
+        stadiumSource,
+        builtinStadiums,
+        randomizerFactorySource,
+        randomizeDefinitionSource,
+        getPhysicsSource,
+    }) => {
         const room = window.HBInit(config);
         const createGoalAttributionEngine = eval(goalAttributionFactorySource);
+        const createStadiumRandomizer = eval(randomizerFactorySource);
+        const randomizeStadiumDefinition = eval(randomizeDefinitionSource);
+        const getStadiumPhysics = eval(getPhysicsSource);
+        const stadiumRandomizer = createStadiumRandomizer({
+            room,
+            builtinStadiums,
+            customStadiumSource: stadiumSource,
+            randomizeDefinition: randomizeStadiumDefinition,
+            getPhysics: getStadiumPhysics,
+            isGameRunning: () => gameState.isGameRunning || room.getScores?.() != null,
+        });
         room.setCustomStadium(stadiumSource);
         room.setScoreLimit(0);
         room.setTimeLimit(3);
@@ -203,6 +264,12 @@ async function initializeRoom(token = null) {
             if (window.statsOnGameStart) {
                 window.statsOnGameStart(players);
             }
+        };
+
+        // Keep the base template in sync with manual stadium-picker selections.
+        // Programmatic changes have byPlayer === null and preserve our base map.
+        room.onStadiumChange = (newStadiumName, byPlayer) => {
+            stadiumRandomizer.onStadiumChange(newStadiumName, byPlayer);
         };
 
         // Game stop
@@ -380,6 +447,14 @@ async function initializeRoom(token = null) {
 
         // Player chat - handle commands
         room.onPlayerChat = (player, message) => {
+            const randomizerResponse = stadiumRandomizer.handleCommand(player, message);
+            if (randomizerResponse !== null) {
+                room.sendAnnouncement(`> ${message}`, null, 0xAAAAAA, "normal", 0);
+                room.sendAnnouncement(randomizerResponse, null, 0xFFFFFF, "normal", 1);
+                room.sendAnnouncement('─────────────────────', null, 0xAAAAAA, "normal", 0);
+                return false;
+            }
+
             if (!message.startsWith('!')) return true;
 
             // Only handle commands from players with valid auth (use playerAuthMap)
@@ -414,6 +489,10 @@ async function initializeRoom(token = null) {
         config: roomConfig,
         goalAttributionFactorySource,
         stadiumSource,
+        builtinStadiums,
+        randomizerFactorySource,
+        randomizeDefinitionSource,
+        getPhysicsSource,
     });
 
     updateState({ status_message: 'Room script executed. Waiting for room link...' });
