@@ -35,6 +35,8 @@ function initializeWith(page, readStadium = readFile, window = {}) {
         updateState() {},
         console,
         URL,
+        setTimeout,
+        clearTimeout,
         readFile: readStadium,
         loadBuiltinStadiums,
         createGoalAttributionEngine,
@@ -70,6 +72,7 @@ test('initialization loads the module-relative stadium in Node and selects it be
     const calls = [];
     const announcements = [];
     const statsCommands = [];
+    let ballDamping = 0.99;
     const room = {
         setCustomStadium(contents) {
             if (calls.length === 0) {
@@ -85,6 +88,7 @@ test('initialization loads the module-relative stadium in Node and selects it be
         setTimeLimit(limit) { calls.push(['time', limit]); },
         sendAnnouncement(message, target) { announcements.push({ message, target }); },
         getPlayerList() { return []; },
+        getDiscProperties() { return { damping: ballDamping }; },
     };
     const testWindow = {
         HBInit(config) {
@@ -119,6 +123,7 @@ test('initialization loads the module-relative stadium in Node and selects it be
     assert.equal(typeof room.onStadiumChange, 'function');
 
     assert.equal(room.onPlayerChat({ id: 7, admin: false }, '!r info'), false);
+    await new Promise(resolve => setImmediate(resolve));
     assert.match(announcements.map(item => item.message).join('\n'), /AAAAuto Arena/);
     assert.equal(room.onPlayerChat({ id: 7, admin: false }, '!rank'), false);
     assert.equal(statsCommands.length, 0, 'ordinary stats commands still require player auth');
@@ -133,15 +138,24 @@ test('initialization loads the module-relative stadium in Node and selects it be
     assert.equal(applied.name, 'Rounded');
     assert.ok([5.5, 5.75, 6, 6.25, 6.5].includes(applied.playerPhysics.kickStrength));
     assert.ok([0.985, 0.9875, 0.99].includes(applied.ballPhysics.damping));
+    assert.doesNotMatch(announcements.map(item => item.message).join('\n'), /randomized/);
+    ballDamping = applied.ballPhysics.damping;
+    room.onStadiumChange('Rounded', null);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.match(announcements.map(item => item.message).join('\n'), /randomized/);
 
     assert.equal(room.onPlayerChat({ id: 7, admin: true }, '!r reset'), false);
     assert.deepEqual(calls.at(-1), { type: 'default', name: 'Rounded' });
+    ballDamping = getStadiumPhysics((await loadBuiltinStadiums()).find(item => item.name === 'Rounded').source).damping;
+    room.onStadiumChange('Rounded', null);
+    await new Promise(resolve => setImmediate(resolve));
 
     room.onGameStart(null);
     assert.equal(room.onPlayerChat({ id: 7, admin: false }, '!r info'), false);
     const beforeActiveReset = calls.length;
     assert.equal(room.onPlayerChat({ id: 7, admin: true }, '!r reset'), false);
     assert.equal(calls.length, beforeActiveReset, 'a running match must not change stadium');
+    await new Promise(resolve => setImmediate(resolve));
     assert.match(announcements.at(-2).message, /Stop the match/);
 });
 

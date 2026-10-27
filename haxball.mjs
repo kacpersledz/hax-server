@@ -217,6 +217,7 @@ async function initializeRoom(token = null) {
 
         // Game start
         room.onGameStart = (byPlayer) => {
+            stadiumRandomizer.onGameStart();
             gameState.isGameRunning = true;
             goalAttribution.resetMatch();
             gameState.matchGoals = {};
@@ -450,8 +451,14 @@ async function initializeRoom(token = null) {
             const randomizerResponse = stadiumRandomizer.handleCommand(player, message);
             if (randomizerResponse !== null) {
                 room.sendAnnouncement(`> ${message}`, null, 0xAAAAAA, "normal", 0);
-                room.sendAnnouncement(randomizerResponse, null, 0xFFFFFF, "normal", 1);
-                room.sendAnnouncement('─────────────────────', null, 0xAAAAAA, "normal", 0);
+                Promise.resolve(randomizerResponse).then(response => {
+                    room.sendAnnouncement(response, null, 0xFFFFFF, "normal", 1);
+                    room.sendAnnouncement('─────────────────────', null, 0xAAAAAA, "normal", 0);
+                }).catch(error => {
+                    console.error('[Stadium randomizer] Command failed:', error);
+                    room.sendAnnouncement('❌ Stadium command failed unexpectedly.', null, 0xFFFFFF, "normal", 1);
+                    room.sendAnnouncement('─────────────────────', null, 0xAAAAAA, "normal", 0);
+                });
                 return false;
             }
 

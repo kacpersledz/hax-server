@@ -46,23 +46,25 @@ function removeRandomizedFields(randomized, original) {
     return normalized;
 }
 
-function makeRandomizer({ isGameRunning = false, randomValues = [] } = {}) {
+function makeRandomizer({ isGameRunning = false, randomValues = [], throwOnSet = false } = {}) {
     let running = isGameRunning;
     let randomIndex = 0;
     let randomizer;
+    let damping = 0.99;
+    let nextTimerId = 0;
+    const timers = new Map();
     const calls = [];
     const room = {
         setCustomStadium(source) {
             calls.push({ type: 'custom', source });
-            const name = JSON.parse(source).name;
-            randomizer.onStadiumChange(name, null);
+            if (throwOnSet) throw new Error('setter failed');
         },
         setDefaultStadium(name) {
             calls.push({ type: 'default', name });
-            randomizer.onStadiumChange(name, null);
+            if (throwOnSet) throw new Error('setter failed');
         },
         getDiscProperties() {
-            return { damping: 0.99 };
+            return { damping };
         },
     };
     randomizer = createRandomizer({
@@ -73,11 +75,36 @@ function makeRandomizer({ isGameRunning = false, randomValues = [] } = {}) {
         getPhysics: getStadiumPhysics,
         isGameRunning: () => running,
         random: () => randomValues[randomIndex++] ?? 0,
+        confirmationTimeoutMs: 100,
+        confirmationPollMs: 10,
+        schedule(callback, delay) {
+            const id = ++nextTimerId;
+            timers.set(id, { callback, delay });
+            return id;
+        },
+        cancelSchedule(id) { timers.delete(id); },
     });
     return {
         randomizer,
         calls,
         setRunning(value) { running = value; },
+        setDamping(value) { damping = value; },
+        confirm(name, value = damping) {
+            damping = value;
+            randomizer.onStadiumChange(name, null);
+        },
+        runTimeout() {
+            const timer = [...timers.entries()].find(([, value]) => value.delay === 100);
+            assert.ok(timer, 'pending operation should have a timeout');
+            timers.delete(timer[0]);
+            timer[1].callback();
+        },
+        runPoll() {
+            const timer = [...timers.entries()].find(([, value]) => value.delay === 10);
+            assert.ok(timer, 'pending operation should have a damping poll');
+            timers.delete(timer[0]);
+            timer[1].callback();
+        },
     };
 }
 
@@ -138,67 +165,155 @@ test('ball damping supports omitted ballPhysics, disc0, and an explicit ballPhys
     assert.equal(explicit.ballPhysics.bCoef, 0.4);
 });
 
-test('repeated randomization always starts from the selected original template', () => {
+test('randomization waits for asynchronous onStadiumChange confirmation and uses the original template each time', async () => {
     const harness = makeRandomizer({ randomValues: [0, 0, 0.99, 0.99] });
     harness.randomizer.onStadiumChange('Rounded', { id: 7, admin: true });
 
-    const firstResponse = harness.randomizer.handleCommand({ id: 7, admin: true }, '!r');
+    let resolved = false;
+    const firstResponse = harness.randomizer.handleCommand({ id: 7, admin: true }, '!r').then(value => {
+        resolved = true;
+        return value;
+    });
     const first = JSON.parse(harness.calls[0].source);
+    await Promise.resolve();
+    assert.equal(resolved, false, 'success must not be announced before confirmation');
+    assert.equal(harness.randomizer.getState().randomized, false);
+    harness.confirm('Rounded', first.ballPhysics.damping);
+    assert.match(await firstResponse, /1\.10x/);
+
     const secondResponse = harness.randomizer.handleCommand({ id: 7, admin: true }, '!r');
     const second = JSON.parse(harness.calls[1].source);
-
-    assert.match(firstResponse, /1\.10x/);
-    assert.match(secondResponse, /1\.30x/);
+    harness.confirm('Rounded', second.ballPhysics.damping);
+    assert.match(await secondResponse, /1\.30x/);
     assert.equal(first.playerPhysics.kickStrength, 5.5);
     assert.equal(first.ballPhysics.damping, 0.985);
     assert.equal(second.playerPhysics.kickStrength, 6.5);
     assert.equal(second.ballPhysics.damping, 0.99);
-    assert.deepEqual(removeRandomizedFields(first, sourceDefinitions.find(item => item.name === 'Rounded').definition), sourceDefinitions.find(item => item.name === 'Rounded').definition);
-    assert.deepEqual(removeRandomizedFields(second, sourceDefinitions.find(item => item.name === 'Rounded').definition), sourceDefinitions.find(item => item.name === 'Rounded').definition);
+    const original = sourceDefinitions.find(item => item.name === 'Rounded').definition;
+    assert.deepEqual(removeRandomizedFields(first, original), original);
+    assert.deepEqual(removeRandomizedFields(second, original), original);
     assert.equal(harness.randomizer.getState().stadium, 'Rounded');
     assert.equal(harness.randomizer.getState().randomized, true);
 });
 
-test('manual selection clears randomized state while programmatic changes preserve the base stadium', () => {
-    const harness = makeRandomizer({ randomValues: [0, 0, 0.5, 0.5] });
-    harness.randomizer.onStadiumChange('Rounded', { id: 7 });
-    harness.randomizer.handleCommand({ admin: true }, '!randomize');
+test('an ignored setter times out without committing randomized state', async () => {
+    const harness = makeRandomizer();
+    const response = harness.randomizer.handleCommand({ admin: true }, '!r');
+    assert.equal(harness.randomizer.getState().randomized, false);
+    assert.equal(harness.randomizer.getState().pending, true);
+    harness.randomizer.onStadiumChange('Small', null);
+    assert.equal(harness.randomizer.getState().pending, true, 'a different stadium event cannot confirm the request');
+    harness.runTimeout();
+    assert.match(await response, /not confirmed/);
+    assert.equal(harness.randomizer.getState().randomized, false);
+    assert.equal(harness.randomizer.getState().pending, false);
+    assert.equal(harness.randomizer.getState().unconfirmed, true);
+});
 
-    harness.randomizer.onStadiumChange('Rounded', null);
-    assert.equal(harness.randomizer.getState().stadium, 'Rounded');
+test('live damping transition can confirm a same-name custom reload if no event is emitted', async () => {
+    const harness = makeRandomizer({ randomValues: [0, 0] });
+    const response = harness.randomizer.handleCommand({ admin: true }, '!r');
+    harness.setDamping(0.985);
+    harness.runPoll();
+    assert.match(await response, /confirmed by live ball damping/);
     assert.equal(harness.randomizer.getState().randomized, true);
+});
 
+test('manual selection cancels a pending operation and late programmatic events do not alter its base', async () => {
+    const harness = makeRandomizer({ randomValues: [0, 0, 0.5, 0.5] });
+    const response = harness.randomizer.handleCommand({ admin: true }, '!randomize');
+    assert.equal(harness.randomizer.getState().randomized, false);
     harness.randomizer.onStadiumChange('Small', { id: 8 });
+    assert.match(await response, /canceled/);
     assert.equal(harness.randomizer.getState().stadium, 'Small');
     assert.equal(harness.randomizer.getState().randomized, false);
-    assert.deepEqual(harness.randomizer.getState().physics, {
-        kickStrength: 5,
-        kickMultiplier: 1,
-        damping: 0.99,
-    });
 
-    harness.randomizer.handleCommand({ admin: true }, '!r');
-    assert.equal(JSON.parse(harness.calls.at(-1).source).name, 'Small');
+    const next = harness.randomizer.handleCommand({ admin: true }, '!r');
+    const definition = JSON.parse(harness.calls.at(-1).source);
+    assert.equal(definition.name, 'Small');
+    harness.randomizer.onStadiumChange('AAAAuto Arena', null);
+    assert.equal(harness.randomizer.getState().stadium, 'Small');
+    assert.equal(harness.randomizer.getState().pending, true, 'a stale event for another stadium must not resolve the new request');
+    harness.confirm('Small', definition.ballPhysics.damping);
+    assert.match(await next, /randomized/);
 });
 
-test('reset restores built-ins through setDefaultStadium and AAAAuto Arena from its original file', () => {
+test('a cancelled same-target request cannot be completed by an indistinguishable stale event', async () => {
+    const harness = makeRandomizer({ randomValues: [0, 0, 0, 0] });
+    const canceled = harness.randomizer.handleCommand({ admin: true }, '!r');
+    harness.randomizer.onStadiumChange('AAAAuto Arena', { id: 8 });
+    assert.match(await canceled, /canceled/);
+
+    const blocked = await harness.randomizer.handleCommand({ admin: true }, '!r');
+    assert.match(blocked, /earlier request.*late event/);
+    assert.equal(harness.calls.length, 1);
+
+    harness.randomizer.onStadiumChange('AAAAuto Arena', null);
+    const retry = harness.randomizer.handleCommand({ admin: true }, '!r');
+    const definition = JSON.parse(harness.calls.at(-1).source);
+    harness.confirm('AAAAuto Arena', definition.discs[0].damping);
+    assert.match(await retry, /randomized/);
+});
+
+test('a match starting cancels the pending request without stopping or restarting the game', async () => {
+    const harness = makeRandomizer();
+    const response = harness.randomizer.handleCommand({ admin: true }, '!r');
+    harness.setRunning(true);
+    harness.randomizer.onGameStart();
+    assert.match(await response, /Match started before the stadium change was confirmed/);
+    assert.equal(harness.randomizer.getState().randomized, false);
+    assert.equal(harness.randomizer.getState().pending, false);
+    assert.match(harness.randomizer.handleCommand({ admin: true }, '!r'), /Stop the match/);
+    assert.equal(harness.calls.length, 1);
+});
+
+test('concurrent mutation commands cannot invoke overlapping setters', async () => {
+    const harness = makeRandomizer();
+    const first = harness.randomizer.handleCommand({ admin: true }, '!r');
+    assert.match(harness.randomizer.handleCommand({ admin: true }, '!r reset'), /already awaiting confirmation/);
+    assert.equal(harness.calls.length, 1);
+    const definition = JSON.parse(harness.calls[0].source);
+    harness.confirm('AAAAuto Arena', definition.discs[0].damping);
+    await first;
+    assert.equal(harness.calls.length, 1);
+});
+
+test('reset commits original physics only after stadium confirmation', async () => {
     const builtin = makeRandomizer({ randomValues: [0, 0] });
     builtin.randomizer.onStadiumChange('Rounded', { id: 7 });
-    builtin.randomizer.handleCommand({ admin: true }, '!r');
-    assert.match(builtin.randomizer.handleCommand({ admin: true }, '!r reset'), /original physics restored/);
+    const apply = builtin.randomizer.handleCommand({ admin: true }, '!r');
+    const applied = JSON.parse(builtin.calls.at(-1).source);
+    builtin.confirm('Rounded', applied.ballPhysics.damping);
+    await apply;
+
+    const reset = builtin.randomizer.handleCommand({ admin: true }, '!r reset');
     assert.deepEqual(builtin.calls.at(-1), { type: 'default', name: 'Rounded' });
+    assert.equal(builtin.randomizer.getState().randomized, true, 'reset waits for its confirmation');
+    builtin.confirm('Rounded', getStadiumPhysics(sourceDefinitions.find(item => item.name === 'Rounded').source).damping);
+    assert.match(await reset, /original physics restored/);
     assert.equal(builtin.randomizer.getState().randomized, false);
-    assert.deepEqual(builtin.randomizer.getState().physics, { kickStrength: 5, kickMultiplier: 1, damping: 0.99 });
 
     const custom = makeRandomizer({ randomValues: [0, 0] });
-    custom.randomizer.handleCommand({ admin: true }, '!r');
-    assert.match(custom.randomizer.handleCommand({ admin: true }, '!r reset'), /original physics restored/);
+    const customApply = custom.randomizer.handleCommand({ admin: true }, '!r');
+    const customApplied = JSON.parse(custom.calls.at(-1).source);
+    custom.confirm('AAAAuto Arena', customApplied.discs[0].damping);
+    await customApply;
+    const customReset = custom.randomizer.handleCommand({ admin: true }, '!r reset');
     assert.deepEqual(custom.calls.at(-1), { type: 'custom', source: customSource });
+    custom.confirm('AAAAuto Arena', getStadiumPhysics(customSource).damping);
+    assert.match(await customReset, /original physics restored/);
     assert.equal(custom.randomizer.getState().randomized, false);
-    assert.deepEqual(custom.randomizer.getState().physics, { kickStrength: 6.5, kickMultiplier: 1.3, damping: 0.99 });
 });
 
-test('only a real HaxBall admin can change physics; auth alone does not grant access', () => {
+test('setter exceptions report failure and preserve the last confirmed state', async () => {
+    const harness = makeRandomizer({ throwOnSet: true });
+    const response = harness.randomizer.handleCommand({ admin: true }, '!r');
+    assert.match(await response, /Could not randomize AAAAuto Arena: setter failed/);
+    assert.equal(harness.randomizer.getState().randomized, false);
+    assert.equal(harness.randomizer.getState().pending, false);
+});
+
+test('only a real HaxBall admin can change physics; auth alone does not grant access', async () => {
     const harness = makeRandomizer({ randomValues: [0, 0] });
     const unauthenticatedAdmin = { id: 1, auth: null, admin: true };
     const authenticatedPlayer = { id: 2, auth: 'valid-auth', admin: false };
@@ -206,8 +321,10 @@ test('only a real HaxBall admin can change physics; auth alone does not grant ac
     assert.match(harness.randomizer.handleCommand(authenticatedPlayer, '!r'), /Only admins/);
     assert.match(harness.randomizer.handleCommand(authenticatedPlayer, '!r reset'), /Only admins/);
     assert.equal(harness.calls.length, 0);
-    assert.match(harness.randomizer.handleCommand(unauthenticatedAdmin, '!r'), /randomized/);
-    assert.equal(harness.calls.length, 1);
+    const response = harness.randomizer.handleCommand(unauthenticatedAdmin, '!r');
+    const applied = JSON.parse(harness.calls[0].source);
+    harness.confirm('AAAAuto Arena', applied.discs[0].damping);
+    assert.match(await response, /randomized/);
 });
 
 test('randomize and reset are rejected while running or paused, but info remains available', () => {
@@ -220,15 +337,20 @@ test('randomize and reset are rejected while running or paused, but info remains
     }
 });
 
-test('aliases are exact and !r does not conflict with !rank', () => {
+test('aliases are exact and !r does not conflict with !rank', async () => {
     const harness = makeRandomizer();
     assert.equal(harness.randomizer.handleCommand({ admin: true }, '!rank'), null);
     assert.equal(harness.randomizer.handleCommand({ admin: true }, '!ranks'), null);
     assert.equal(harness.randomizer.handleCommand({ admin: true }, '!randomizer'), null);
     assert.equal(harness.randomizer.handleCommand({ admin: true }, '!r unexpected'), null);
     assert.match(harness.randomizer.handleCommand({ admin: false }, '!r info'), /AAAAuto Arena/);
-    assert.match(harness.randomizer.handleCommand({ admin: true }, '!r'), /randomized/);
-    assert.match(harness.randomizer.handleCommand({ admin: true }, '!randomize reset'), /original physics restored/);
+    const apply = harness.randomizer.handleCommand({ admin: true }, '!r');
+    const applied = JSON.parse(harness.calls.at(-1).source);
+    harness.confirm('AAAAuto Arena', applied.discs[0].damping);
+    assert.match(await apply, /randomized/);
+    const reset = harness.randomizer.handleCommand({ admin: true }, '!randomize reset');
+    harness.confirm('AAAAuto Arena', getStadiumPhysics(customSource).damping);
+    assert.match(await reset, /original physics restored/);
 });
 
 test('unsupported custom stadiums get a clear error and never use another template', () => {

@@ -43,6 +43,20 @@ template. `!randomize info` still shows its name and live ball damping; the
 kick multiplier is shown as unknown when HaxBall has not provided a bundled
 template for that custom stadium.
 
+The Headless API applies stadium setters asynchronously and ignores them while
+a game is in progress. Randomize and reset commands therefore wait for
+`onStadiumChange` and, when available, the live ball damping to match before
+reporting success. If a same-name custom reload does not emit an event, a
+change in live damping can confirm the reload; an already-matching damping
+value cannot. Requests that receive no confirmation time out as unconfirmed,
+and a game start or manual stadium selection cancels a pending request. The
+API event contains only the stadium name and player, with no request id, so an
+identical late event cannot always be distinguished from a newer request. The
+randomizer blocks an identical retry after such an interruption until that
+late event is observed. HaxBall also provides no getter for player kick
+strength: the reported multiplier is the value sent in the stadium payload,
+not a live readback. See the [Headless API reference](https://github.com/haxball/haxball-issues/wiki/Headless-Host).
+
 The ten bundled built-in definitions and their source checksums are documented
 in [stadiums/builtin/README.md](stadiums/builtin/README.md). They are verified
 locally at startup; randomization does not make network requests.

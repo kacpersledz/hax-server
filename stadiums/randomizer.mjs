@@ -108,20 +108,110 @@ export function createStadiumRandomizer({
     getPhysics,
     isGameRunning,
     random = Math.random,
+    confirmationTimeoutMs = 5000,
+    confirmationPollMs = 25,
+    schedule = setTimeout,
+    cancelSchedule = clearTimeout,
 }) {
     const builtins = new Map(builtinStadiums.map(stadium => [stadium.name, stadium.source]));
     const customName = 'AAAAuto Arena';
     let selected = { name: customName, source: customStadiumSource, type: 'custom' };
     let randomizedPhysics = null;
+    let pending = null;
+    let unconfirmedReason = null;
+    // Events carry no operation id. Remember cancelled targets so an
+    // indistinguishable late event cannot satisfy a later identical request.
+    const abandonedTargets = new Set();
+    const abandonedNames = new Set();
+
+    function readBallDamping() {
+        const damping = room.getDiscProperties?.(0)?.damping;
+        return Number.isFinite(damping) ? damping : null;
+    }
+
+    function sameDamping(left, right) {
+        return Number.isFinite(left) && Number.isFinite(right) && Math.abs(left - right) < 1e-9;
+    }
+
+    function targetKey(name, damping) {
+        return `${name}\u0000${damping}`;
+    }
+
+    function clearAbandonedTargets(name) {
+        for (const key of abandonedTargets) {
+            if (key.startsWith(`${name}\u0000`)) abandonedTargets.delete(key);
+        }
+        abandonedNames.delete(name);
+    }
+
+    function clearTimers(operation) {
+        if (operation.timeout !== null) cancelSchedule(operation.timeout);
+        if (operation.poll !== null) cancelSchedule(operation.poll);
+        operation.timeout = null;
+        operation.poll = null;
+    }
+
+    function finish(operation, message, { confirmed = false, uncertain = false } = {}) {
+        if (pending !== operation) return;
+        clearTimers(operation);
+        pending = null;
+        if (confirmed) {
+            randomizedPhysics = operation.kind === 'randomize' ? operation.physics : null;
+            unconfirmedReason = null;
+            abandonedTargets.delete(operation.key);
+        } else if (uncertain) {
+            unconfirmedReason = 'A stadium setter may have taken effect without a matching confirmation.';
+            abandonedTargets.add(operation.key);
+            abandonedNames.add(operation.expectedName);
+        }
+        operation.resolve(message);
+    }
+
+    function checkConfirmation(operation) {
+        if (pending !== operation) return;
+        const damping = readBallDamping();
+        const dampingMatches = sameDamping(damping, operation.physics.damping);
+        const dampingChangedToTarget = dampingMatches
+            && Number.isFinite(operation.beforeDamping)
+            && !sameDamping(operation.beforeDamping, operation.physics.damping);
+
+        // A matching event confirms the selected stadium. When a damping
+        // getter is available, also wait until it reflects the requested value.
+        if (operation.eventSeen && (damping === null || dampingMatches)) {
+            finish(operation, operation.successMessage('event'), { confirmed: true });
+            return;
+        }
+
+        // Some Headless API versions may not emit onStadiumChange when a
+        // custom stadium is reloaded under the same name. A real transition in
+        // the ball's live damping is useful evidence; an already-equal value
+        // is not, because it cannot distinguish an ignored request.
+        if (dampingChangedToTarget) {
+            finish(operation, operation.successMessage('damping'), { confirmed: true });
+        }
+    }
+
+    function pollConfirmation(operation) {
+        if (pending !== operation) return;
+        checkConfirmation(operation);
+        if (pending === operation) {
+            operation.poll = schedule(() => pollConfirmation(operation), confirmationPollMs);
+        }
+    }
+
+    function cancelPending(message, { uncertain = false } = {}) {
+        if (!pending) return;
+        const operation = pending;
+        finish(operation, message, { uncertain });
+    }
 
     function resolveSelectedPhysics() {
         if (randomizedPhysics) return randomizedPhysics;
         if (selected.source) return getPhysics(selected.source);
-        const ball = room.getDiscProperties?.(0);
         return {
             kickStrength: null,
             kickMultiplier: null,
-            damping: Number.isFinite(ball?.damping) ? ball.damping : null,
+            damping: readBallDamping(),
         };
     }
 
@@ -132,23 +222,98 @@ export function createStadiumRandomizer({
             : `${physics.kickMultiplier.toFixed(2)}x`;
         const damping = physics.damping === null ? 'unknown' : String(physics.damping);
         const status = randomizedPhysics ? 'randomized' : 'original';
-        return `🏟 ${selected.name}\n⚽ Kick: ${kick}\n🛑 Damping: ${damping}\n🎲 Physics: ${status}`;
+        const confirmation = pending
+            ? '\n⏳ Waiting for stadium confirmation.'
+            : unconfirmedReason
+                ? `\n⚠️ ${unconfirmedReason}`
+                : '';
+        return `🏟 ${selected.name}\n⚽ Kick: ${kick}\n🛑 Damping: ${damping}\n🎲 Physics: ${status}${confirmation}`;
     }
 
     function onStadiumChange(newStadiumName, byPlayer) {
-        // The Headless API uses null for programmatic changes. Preserve the
-        // selected base template while our own custom stadium is applied.
-        if (byPlayer == null) return;
+        // A player event always wins over a pending setter and becomes the new
+        // base template. Its event is also the confirmation of the manual map.
+        if (byPlayer != null) {
+            cancelPending('⚠️ Stadium request canceled because a player changed the stadium before confirmation.', { uncertain: true });
 
-        const source = builtins.get(newStadiumName);
-        if (source) {
-            selected = { name: newStadiumName, source, type: 'builtin' };
-        } else if (newStadiumName === customName) {
-            selected = { name: customName, source: customStadiumSource, type: 'custom' };
-        } else {
-            selected = { name: newStadiumName || 'Unknown custom stadium', source: null, type: 'unsupported' };
+            const source = builtins.get(newStadiumName);
+            if (source) {
+                selected = { name: newStadiumName, source, type: 'builtin' };
+            } else if (newStadiumName === customName) {
+                selected = { name: customName, source: customStadiumSource, type: 'custom' };
+            } else {
+                selected = { name: newStadiumName || 'Unknown custom stadium', source: null, type: 'unsupported' };
+            }
+            randomizedPhysics = null;
+            unconfirmedReason = null;
+            return;
         }
-        randomizedPhysics = null;
+
+        // Programmatic changes without a live request may be late callbacks
+        // from an operation that was cancelled. They must not change the base
+        // stadium selected by a player.
+        if (!pending) {
+            clearAbandonedTargets(newStadiumName);
+            return;
+        }
+
+        if (newStadiumName !== pending.expectedName) {
+            clearAbandonedTargets(newStadiumName);
+            return;
+        }
+
+        const damping = readBallDamping();
+        const dampingChangedToTarget = sameDamping(damping, pending.physics.damping)
+            && Number.isFinite(pending.beforeDamping)
+            && !sameDamping(pending.beforeDamping, pending.physics.damping);
+        // If an older operation for this name was interrupted, a name-only
+        // event is ambiguous. A new observed damping transition can still
+        // confirm this request; an already-equal value cannot.
+        if (abandonedNames.has(newStadiumName) && !dampingChangedToTarget) {
+            clearAbandonedTargets(newStadiumName);
+            return;
+        }
+        pending.eventSeen = true;
+        checkConfirmation(pending);
+    }
+
+    function beginOperation({ kind, source, expectedName, physics, setter, successMessage }) {
+        const beforeDamping = readBallDamping();
+        const key = targetKey(expectedName, physics.damping);
+        if (abandonedTargets.has(key)
+            || (abandonedNames.has(expectedName)
+                && (beforeDamping === null || sameDamping(beforeDamping, physics.damping)))) {
+            return Promise.resolve(`❌ Cannot confirm this ${expectedName} change safely: an earlier request for this stadium may still emit an indistinguishable late event. Select another stadium or restart the room before retrying with the current damping.`);
+        }
+
+        let resolve;
+        const result = new Promise(done => { resolve = done; });
+        const operation = {
+            kind,
+            source,
+            expectedName,
+            physics,
+            key,
+            beforeDamping,
+            eventSeen: false,
+            timeout: null,
+            poll: null,
+            resolve,
+            successMessage,
+        };
+        pending = operation;
+        unconfirmedReason = null;
+        operation.timeout = schedule(() => {
+            finish(operation, `❌ The ${expectedName} change was not confirmed within ${confirmationTimeoutMs} ms. It may have applied, but its state is unconfirmed.`, { uncertain: true });
+        }, confirmationTimeoutMs);
+        operation.poll = schedule(() => pollConfirmation(operation), confirmationPollMs);
+
+        try {
+            setter();
+        } catch (error) {
+            finish(operation, `❌ Could not ${kind === 'reset' ? 'restore' : 'randomize'} ${expectedName}: ${error.message}`);
+        }
+        return result;
     }
 
     function handleCommand(player, message) {
@@ -160,19 +325,27 @@ export function createStadiumRandomizer({
 
         if (player?.admin !== true) return '❌ Only admins can change stadium physics.';
         if (isGameRunning()) return '⚠️ Stop the match before randomizing physics.';
+        if (pending) return '⚠️ A stadium change is already awaiting confirmation.';
         if (selected.type === 'unsupported') {
             return `❌ Cannot change physics for unsupported custom stadium: ${selected.name}.`;
         }
 
         if (action === 'reset') {
+            const expectedPhysics = getPhysics(selected.source);
             try {
-                if (selected.type === 'builtin') {
-                    room.setDefaultStadium(selected.name);
-                } else {
-                    room.setCustomStadium(customStadiumSource);
-                }
-                randomizedPhysics = null;
-                return `✅ ${selected.name} original physics restored.`;
+                return beginOperation({
+                    kind: 'reset',
+                    source: selected.source,
+                    expectedName: selected.name,
+                    physics: expectedPhysics,
+                    setter: () => {
+                        if (selected.type === 'builtin') room.setDefaultStadium(selected.name);
+                        else room.setCustomStadium(customStadiumSource);
+                    },
+                    successMessage: confirmation => confirmation === 'damping'
+                        ? `✅ ${selected.name} reset; original ball damping ${expectedPhysics.damping} was observed. Kick strength has no Headless API readback.`
+                        : `✅ ${selected.name} original physics restored. Kick strength has no Headless API readback.`,
+                });
             } catch (error) {
                 return `❌ Could not restore ${selected.name}: ${error.message}`;
             }
@@ -180,13 +353,21 @@ export function createStadiumRandomizer({
 
         try {
             const result = randomizeDefinition(selected.source, random);
-            room.setCustomStadium(JSON.stringify(result.stadium));
-            randomizedPhysics = {
+            const physics = {
                 kickStrength: result.kickStrength,
                 kickMultiplier: result.kickMultiplier,
                 damping: result.damping,
             };
-            return `🎲 ${selected.name} randomized!\n⚽ Kick: ${result.kickMultiplier.toFixed(2)}x\n🛑 Damping: ${result.damping}`;
+            return beginOperation({
+                kind: 'randomize',
+                source: selected.source,
+                expectedName: selected.name,
+                physics,
+                setter: () => room.setCustomStadium(JSON.stringify(result.stadium)),
+                successMessage: confirmation => confirmation === 'damping'
+                    ? `🎲 ${selected.name} stadium change confirmed by live ball damping.\n⚽ Kick set to ${result.kickMultiplier.toFixed(2)}x (the Headless API has no kick-strength readback)\n🛑 Damping: ${result.damping}`
+                    : `🎲 ${selected.name} randomized.\n⚽ Kick set to ${result.kickMultiplier.toFixed(2)}x (the Headless API has no kick-strength readback)\n🛑 Damping: ${result.damping} (confirmed)`,
+            });
         } catch (error) {
             return `❌ Could not randomize ${selected.name}: ${error.message}`;
         }
@@ -195,12 +376,17 @@ export function createStadiumRandomizer({
     return {
         handleCommand,
         onStadiumChange,
+        onGameStart() {
+            cancelPending('⚠️ Match started before the stadium change was confirmed. No success was reported.', { uncertain: true });
+        },
         getState() {
             return {
                 stadium: selected.name,
                 type: selected.type,
                 randomized: randomizedPhysics !== null,
                 physics: resolveSelectedPhysics(),
+                pending: pending !== null,
+                unconfirmed: unconfirmedReason !== null,
             };
         },
     };
