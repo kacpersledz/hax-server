@@ -55,20 +55,25 @@ reporting success. If a same-name custom reload does not emit an event, a
 change in live damping can confirm the reload; an already-matching damping
 value cannot. Requests that receive no confirmation time out as unconfirmed.
 If a late or unexpected programmatic stadium callback arrives, `!r info` marks
-the current stadium as unknown and `!r`/`!r reset` remain blocked until the
-outstanding callback is observed and a supported stadium is selected manually.
-A manual selection made while an operation is pending also leaves the state
-unknown, since the canceled setter could still apply afterward. If no late
-callback arrives, restarting the room is the only way to clear that uncertainty
-safely.
+the current stadium as unknown and `!r`/`!r reset` remain blocked until a
+supported stadium is selected manually. A manual selection made while an
+operation is pending also leaves the state unknown, since the canceled setter
+could still apply afterward. Once no operation is pending, a fresh supported
+manual selection restores a known base; a later callback from an abandoned
+request will mark the state unknown again.
+
+If a callback could belong either to an abandoned randomization or to a newer
+reset for the same stadium and damping, the reset is reported as unconfirmed
+and physics remain unknown. A fresh supported manual selection can resynchronize
+the base after that ambiguity.
 
 The Headless API reference lists `onStadiumChange` but no method for inspecting
 the current stadium, and its event contains only the stadium name and player,
-with no request id. A reset after an unconfirmed request may therefore be
-attempted but still time out if the stadium and damping already match and no
-event distinguishes it from a stale callback. HaxBall also provides no getter
-for player kick strength: the reported multiplier is the value sent in the
-stadium payload, not a live readback. See the
+with no request id. When an abandoned request and a newer reset have the same
+stadium and damping, the API cannot distinguish their callbacks. The server
+keeps physics unknown instead of treating that event as reset confirmation.
+HaxBall also provides no getter for player kick strength: the reported
+multiplier is the value sent in the stadium payload, not a live readback. See the
 [Headless API reference](https://github.com/haxball/haxball-issues/wiki/Headless-Host).
 
 The ten bundled built-in definitions and their source checksums are documented

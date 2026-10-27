@@ -153,7 +153,7 @@ export function createStadiumRandomizer({
         operation.poll = null;
     }
 
-    function finish(operation, message, { confirmed = false, uncertain = false } = {}) {
+    function finish(operation, message, { confirmed = false, uncertain = false, reason = null } = {}) {
         if (pending !== operation) return;
         clearTimers(operation);
         pending = null;
@@ -167,7 +167,7 @@ export function createStadiumRandomizer({
             randomizedPhysics = null;
             physicsStatus = 'unknown';
             if (operation.identityAffecting) stadiumIdentityKnown = false;
-            unconfirmedReason = 'A stadium setter may have taken effect without a matching confirmation.';
+            unconfirmedReason = reason || 'A stadium setter may have taken effect without a matching confirmation.';
             abandonedTargets.add(operation.key);
             abandonedNames.add(operation.expectedName);
         } else {
@@ -183,6 +183,10 @@ export function createStadiumRandomizer({
 
     function checkConfirmation(operation) {
         if (pending !== operation) return;
+        // A damping transition cannot disambiguate a retry when an abandoned
+        // operation has this same target. Wait for the event handler to apply
+        // its stale-target guard or let the request time out as unknown.
+        if (abandonedTargets.has(operation.key)) return;
         const damping = readBallDamping();
         const dampingMatches = sameDamping(damping, operation.physics.damping);
         const dampingChangedToTarget = dampingMatches
@@ -267,11 +271,10 @@ export function createStadiumRandomizer({
                 stadiumIdentityKnown = false;
                 physicsStatus = 'unknown';
                 unconfirmedReason = 'A canceled stadium change may still apply. Manually select a supported stadium again after it settles.';
-            } else if (abandonedNames.size > 0) {
-                stadiumIdentityKnown = false;
-                physicsStatus = 'unknown';
-                unconfirmedReason = 'A canceled programmatic change may still apply. Wait for its callback, then manually select a supported stadium to resynchronize.';
             } else {
+                // A fresh player selection establishes a supported base again.
+                // Keep abandoned targets recorded so a later programmatic
+                // callback can still invalidate this state if it arrives.
                 stadiumIdentityKnown = true;
                 physicsStatus = selected.type === 'unsupported' ? 'unknown' : 'original';
                 unconfirmedReason = selected.type === 'unsupported'
@@ -309,9 +312,27 @@ export function createStadiumRandomizer({
         const dampingChangedToTarget = sameDamping(damping, pending.physics.damping)
             && Number.isFinite(pending.beforeDamping)
             && !sameDamping(pending.beforeDamping, pending.physics.damping);
-        // If an older operation for this name was interrupted, a name-only
-        // event is ambiguous. A new observed damping transition can still
-        // confirm this request; an already-equal value cannot.
+        // A late setter and a newer reset can have the same stadium name and
+        // damping. Headless events have no request id, and kick strength has
+        // no readback, so neither the event nor the damping transition can
+        // identify which payload was applied.
+        if (abandonedTargets.has(targetKey(newStadiumName, pending.physics.damping))) {
+            const operation = pending;
+            finish(
+                operation,
+                `⚠️ Could not safely confirm ${operation.kind === 'reset' ? 'reset' : 'randomization'}: an earlier ${newStadiumName} change may have produced the same stadium and damping. Physics are unknown; manually select a supported stadium to resynchronize.`,
+                {
+                    uncertain: true,
+                    reason: `A stadium callback for ${newStadiumName} is ambiguous with an earlier request for the same damping (${pending.physics.damping}). Manually select a supported stadium to resynchronize.`,
+                },
+            );
+            stadiumIdentityKnown = false;
+            return;
+        }
+        // For older operations on this name with different target damping, a
+        // name-only callback is insufficient. A transition to this request's
+        // damping remains useful evidence; an already-equal value cannot be
+        // tied to this request.
         if (abandonedNames.has(newStadiumName) && !dampingChangedToTarget) {
             clearAbandonedTargets(newStadiumName);
             return;

@@ -334,6 +334,50 @@ test('reset commits original physics only after stadium confirmation', async () 
     assert.equal(custom.randomizer.getState().randomized, false);
 });
 
+test('an abandoned randomization cannot falsely confirm a reset with the same damping', async () => {
+    const harness = makeRandomizer({ randomValues: [0, 0, 0, 0.99] });
+    harness.randomizer.onStadiumChange('Rounded', { id: 7 });
+
+    const first = harness.randomizer.handleCommand({ admin: true }, '!r');
+    harness.confirm('Rounded', 0.985);
+    assert.match(await first, /randomized/);
+    assert.equal(harness.randomizer.getState().physics.damping, 0.985);
+
+    const abandoned = harness.randomizer.handleCommand({ admin: true }, '!r');
+    const requested = JSON.parse(harness.calls.at(-1).source);
+    assert.equal(requested.ballPhysics.damping, 0.99);
+    harness.runTimeout();
+    assert.match(await abandoned, /not confirmed/);
+
+    let resetResolved = false;
+    const reset = harness.randomizer.handleCommand({ admin: true }, '!r reset').then(value => {
+        resetResolved = true;
+        return value;
+    });
+    assert.deepEqual(harness.calls.at(-1), { type: 'default', name: 'Rounded' });
+
+    // The old randomization and the reset have the same observable stadium
+    // name and damping. The callback cannot identify which payload applied.
+    harness.setDamping(0.99);
+    harness.runPoll();
+    await Promise.resolve();
+    assert.equal(resetResolved, false, 'matching damping alone must not confirm reset');
+    harness.confirm('Rounded', 0.99);
+    assert.match(await reset, /Could not safely confirm reset/);
+    assert.equal(harness.randomizer.getState().physicsStatus, 'unknown');
+    assert.notEqual(harness.randomizer.getState().physicsStatus, 'original');
+    assert.equal(harness.randomizer.getState().stadiumIdentityKnown, false);
+    assert.match(harness.randomizer.handleCommand({ admin: false }, '!r info'), /unknown \/ unconfirmed/);
+    assert.match(harness.randomizer.handleCommand({ admin: true }, '!r'), /identity is uncertain/);
+    assert.match(harness.randomizer.handleCommand({ admin: true }, '!r reset'), /identity is uncertain/);
+
+    // A fresh supported player selection restores a usable, known base.
+    harness.randomizer.onStadiumChange('Rounded', { id: 8 });
+    assert.equal(harness.randomizer.getState().stadiumIdentityKnown, true);
+    assert.equal(harness.randomizer.getState().physicsStatus, 'original');
+    assert.equal(harness.randomizer.handleCommand({ admin: true }, '!r reset'), '✅ Original physics already active.');
+});
+
 test('setter exceptions report failure and invalidate the confirmed physics state', async () => {
     const harness = makeRandomizer({ throwOnSet: true });
     const response = harness.randomizer.handleCommand({ admin: true }, '!r');
