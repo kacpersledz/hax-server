@@ -373,7 +373,10 @@ export class HaxballStatsTracker {
 !me - twoje statystyki
 !stats [nazwa] - statystyki gracza
 !rank - ranking top ${CONFIG.RANK_LIMIT} strzelców
-!last - wyniki ostatniego meczu`;
+!last - wyniki ostatniego meczu
+!randomize / !r - losuje fizykę stadionu (admin, mecz zatrzymany)
+!randomize reset / !r reset - przywraca oryginalną fizykę (admin, mecz zatrzymany)
+!randomize info / !r info - pokazuje fizykę (wszyscy, również podczas meczu)`;
     }
 
     /**
