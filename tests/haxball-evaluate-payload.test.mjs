@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { createCompetition } from '../competition/controller.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -17,7 +18,7 @@ const source = readFileSync(new URL('../haxball.mjs', import.meta.url), 'utf8');
 test('haxball room script passes one payload object to page.evaluate', () => {
     assert.match(source, /page\.evaluate\(\(\{\s*config,\s*goalAttributionFactorySource,\s*stadiumSource,\s*builtinStadiums,\s*randomizerFactorySource,\s*randomizeDefinitionSource,\s*getPhysicsSource,/s);
     assert.match(source, /window\.HBInit\(config\)/);
-    assert.match(source, /\},\s*\{\s*config:\s*roomConfig,\s*goalAttributionFactorySource,\s*stadiumSource,\s*builtinStadiums,\s*randomizerFactorySource,\s*randomizeDefinitionSource,\s*getPhysicsSource,\s*\}\s*\);/s);
+    assert.match(source, /\},\s*\{\s*config:\s*roomConfig,\s*goalAttributionFactorySource,\s*stadiumSource,\s*builtinStadiums,\s*randomizerFactorySource,\s*randomizeDefinitionSource,\s*getPhysicsSource,\s*competitionFactorySource,\s*\}\s*\);/s);
     assert.doesNotMatch(source, /page\.evaluate\(\(config,\s*goalAttributionFactorySource\)\s*=>/);
     assert.doesNotMatch(source, /\},\s*roomConfig,\s*goalAttributionFactorySource\s*\);/);
 });
@@ -40,6 +41,7 @@ function initializeWith(page, readStadium = readFile, window = {}) {
         readFile: readStadium,
         loadBuiltinStadiums,
         createGoalAttributionEngine,
+        createCompetition,
         createStadiumRandomizer,
         randomizeStadiumDefinition,
         getStadiumPhysics,
@@ -105,7 +107,7 @@ test('initialization loads the module-relative stadium in Node and selects it be
         async exposeFunction() {},
         async evaluate(callback, payload) {
             assert.deepEqual(Object.keys(payload).sort(), [
-                'builtinStadiums', 'config', 'getPhysicsSource', 'goalAttributionFactorySource',
+                'builtinStadiums', 'competitionFactorySource', 'config', 'getPhysicsSource', 'goalAttributionFactorySource',
                 'randomizeDefinitionSource', 'randomizerFactorySource', 'stadiumSource',
             ]);
             assert.equal(payload.stadiumSource, stadiumSource);

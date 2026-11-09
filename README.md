@@ -79,3 +79,9 @@ multiplier is the value sent in the stadium payload, not a live readback. See th
 The ten bundled built-in definitions and their source checksums are documented
 in [stadiums/builtin/README.md](stadiums/builtin/README.md). They are verified
 locally at startup; randomization does not make network requests.
+
+## Competitions
+
+An admin starts a competition with exactly four authenticated players in the room using `!comp start`. The default `rematch` mode plays all three 2v2 partnerships twice, swapping sides for the second match (six matches). `!comp mode single` selects one match per partnership (three matches); `!comp mode rematch` restores the default. Select the mode before starting. Physics are randomized and confirmed before every match. The next match starts without a deliberate delay. No new competition starts automatically.
+
+`!comp status`, `!comp pause`, `!comp resume`, and `!comp stop` provide admin control. Pausing does not stop a match. If a participant leaves or an admin changes teams, the competition pauses; restore the same participants to their teams and use `!comp resume`. A match stopped while paused is counted, and the next match starts after resuming. Stopping a match normally counts its current score. `!comp stop` ends the competition without stopping an ongoing match. Additional players may spectate after the competition starts. The competition state is lost on room restart.
