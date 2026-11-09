@@ -11,7 +11,7 @@ export const BUILTIN_STADIUMS = [
     { name: 'Huge', file: 'huge.hbs', sourceSha: 'fb73cfe906faeb5327330c28b8559bf77d456f7d' },
 ];
 
-export const KICK_MULTIPLIERS = [1.10, 1.15, 1.20, 1.25, 1.30];
+export const KICK_MULTIPLIERS = [1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40];
 export const KICK_STRENGTHS = KICK_MULTIPLIERS.map(multiplier => multiplier * 5);
 export const BALL_DAMPING_VALUES = [0.985, 0.9875, 0.990];
 
@@ -48,7 +48,7 @@ export function getStadiumPhysics(definition) {
 }
 
 export function randomizeStadiumDefinition(definition, random = Math.random) {
-    const kickMultipliers = [1.10, 1.15, 1.20, 1.25, 1.30];
+    const kickMultipliers = [1.10, 1.15, 1.20, 1.25, 1.30, 1.35, 1.40];
     const ballDampingValues = [0.985, 0.9875, 0.990];
 
     function pickDiscreteValue(values) {

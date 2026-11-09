@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { createCompetition } from '../competition/controller.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
@@ -17,7 +18,7 @@ const source = readFileSync(new URL('../haxball.mjs', import.meta.url), 'utf8');
 test('haxball room script passes one payload object to page.evaluate', () => {
     assert.match(source, /page\.evaluate\(\(\{\s*config,\s*goalAttributionFactorySource,\s*stadiumSource,\s*builtinStadiums,\s*randomizerFactorySource,\s*randomizeDefinitionSource,\s*getPhysicsSource,/s);
     assert.match(source, /window\.HBInit\(config\)/);
-    assert.match(source, /\},\s*\{\s*config:\s*roomConfig,\s*goalAttributionFactorySource,\s*stadiumSource,\s*builtinStadiums,\s*randomizerFactorySource,\s*randomizeDefinitionSource,\s*getPhysicsSource,\s*\}\s*\);/s);
+    assert.match(source, /\},\s*\{\s*config:\s*roomConfig,\s*goalAttributionFactorySource,\s*stadiumSource,\s*builtinStadiums,\s*randomizerFactorySource,\s*randomizeDefinitionSource,\s*getPhysicsSource,\s*competitionFactorySource,\s*\}\s*\);/s);
     assert.doesNotMatch(source, /page\.evaluate\(\(config,\s*goalAttributionFactorySource\)\s*=>/);
     assert.doesNotMatch(source, /\},\s*roomConfig,\s*goalAttributionFactorySource\s*\);/);
 });
@@ -40,6 +41,7 @@ function initializeWith(page, readStadium = readFile, window = {}) {
         readFile: readStadium,
         loadBuiltinStadiums,
         createGoalAttributionEngine,
+        createCompetition,
         createStadiumRandomizer,
         randomizeStadiumDefinition,
         getStadiumPhysics,
@@ -73,6 +75,7 @@ test('initialization loads the module-relative stadium in Node and selects it be
     const announcements = [];
     const statsCommands = [];
     let ballDamping = 0.99;
+    const roomPlayers = [];
     const room = {
         setCustomStadium(contents) {
             if (calls.length === 0) {
@@ -88,7 +91,7 @@ test('initialization loads the module-relative stadium in Node and selects it be
         setScoreLimit(limit) { calls.push(['score', limit]); },
         setTimeLimit(limit) { calls.push(['time', limit]); },
         sendAnnouncement(message, target) { announcements.push({ message, target }); },
-        getPlayerList() { return []; },
+        getPlayerList() { return roomPlayers; },
         getDiscProperties() { return { damping: ballDamping }; },
     };
     const testWindow = {
@@ -105,7 +108,7 @@ test('initialization loads the module-relative stadium in Node and selects it be
         async exposeFunction() {},
         async evaluate(callback, payload) {
             assert.deepEqual(Object.keys(payload).sort(), [
-                'builtinStadiums', 'config', 'getPhysicsSource', 'goalAttributionFactorySource',
+                'builtinStadiums', 'competitionFactorySource', 'config', 'getPhysicsSource', 'goalAttributionFactorySource',
                 'randomizeDefinitionSource', 'randomizerFactorySource', 'stadiumSource',
             ]);
             assert.equal(payload.stadiumSource, stadiumSource);
@@ -131,7 +134,16 @@ test('initialization loads the module-relative stadium in Node and selects it be
     assert.equal(room.onPlayerChat({ id: 7, admin: false }, '!rank'), false);
     assert.equal(statsCommands.length, 0, 'ordinary stats commands still require player auth');
 
-    room.onPlayerJoin({ id: 7, name: 'Test player', auth: 'valid-auth', admin: true });
+    const firstPlayer = { id: 7, name: 'Test player', auth: 'valid-auth', admin: true };
+    roomPlayers.push(firstPlayer);
+    room.onPlayerJoin(firstPlayer);
+    assert.match(announcements.filter(item => item.target === 7).map(item => item.message).join(' '), /!comp start.*!comp mode single.*!comp mode rematch/);
+    const greetingCount = announcements.length;
+    const secondPlayer = { id: 8, name: 'Second', auth: 'second-auth' };
+    roomPlayers.push(secondPlayer);
+    room.onPlayerJoin(secondPlayer);
+    assert.equal(announcements.length, greetingCount, 'later joins do not repeat the greeting');
+    roomPlayers.length = 0;
     assert.equal(room.onPlayerChat({ id: 7, admin: true }, '!rank'), false);
     assert.deepEqual(statsCommands, [{ auth: 'valid-auth', message: '!rank' }]);
 
@@ -139,7 +151,7 @@ test('initialization loads the module-relative stadium in Node and selects it be
     assert.equal(room.onPlayerChat({ id: 7, admin: true }, '!r'), false);
     const applied = JSON.parse(calls.find(call => call.type === 'custom').source);
     assert.equal(applied.name, 'Rounded');
-    assert.ok([5.5, 5.75, 6, 6.25, 6.5].includes(applied.playerPhysics.kickStrength));
+    assert.ok([5.5, 5.75, 6, 6.25, 6.5, 6.75, 7].includes(applied.playerPhysics.kickStrength));
     assert.ok([0.985, 0.9875, 0.99].includes(applied.ballPhysics.damping));
     assert.doesNotMatch(announcements.map(item => item.message).join('\n'), /randomized/);
     ballDamping = applied.ballPhysics.damping;

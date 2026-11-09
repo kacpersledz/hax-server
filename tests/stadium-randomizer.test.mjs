@@ -187,10 +187,10 @@ test('randomization waits for asynchronous onStadiumChange confirmation and uses
     const secondResponse = harness.randomizer.handleCommand({ id: 7, admin: true }, '!r');
     const second = JSON.parse(harness.calls[1].source);
     harness.confirm('Rounded', second.ballPhysics.damping);
-    assert.match(await secondResponse, /1\.30x/);
+    assert.match(await secondResponse, /1\.40x/);
     assert.equal(first.playerPhysics.kickStrength, 5.5);
     assert.equal(first.ballPhysics.damping, 0.985);
-    assert.equal(second.playerPhysics.kickStrength, 6.5);
+    assert.equal(second.playerPhysics.kickStrength, 7);
     assert.equal(second.ballPhysics.damping, 0.99);
     const original = sourceDefinitions.find(item => item.name === 'Rounded').definition;
     assert.deepEqual(removeRandomizedFields(first, original), original);

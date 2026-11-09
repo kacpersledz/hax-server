@@ -1,3 +1,4 @@
+import { createCompetition } from "./competition/controller.mjs";
 import { chromium } from "playwright";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
@@ -108,6 +109,7 @@ async function initializeRoom(token = null) {
     const builtinStadiums = await loadBuiltinStadiums();
 
     const goalAttributionFactorySource = `(${createGoalAttributionEngine.toString()})`;
+    const competitionFactorySource = `(${createCompetition.toString()})`;
     const randomizerFactorySource = `(${createStadiumRandomizer.toString()})`;
     const randomizeDefinitionSource = `(${randomizeStadiumDefinition.toString()})`;
     const getPhysicsSource = `(${getStadiumPhysics.toString()})`;
@@ -120,6 +122,7 @@ async function initializeRoom(token = null) {
         randomizerFactorySource,
         randomizeDefinitionSource,
         getPhysicsSource,
+        competitionFactorySource,
     }) => {
         const room = window.HBInit(config);
         const createGoalAttributionEngine = eval(goalAttributionFactorySource);
@@ -134,10 +137,12 @@ async function initializeRoom(token = null) {
             getPhysics: getStadiumPhysics,
             isGameRunning: () => gameState.isGameRunning || room.getScores?.() != null,
         });
+        let competition;
         // Install the callback before the initial asynchronous setter so the
         // randomizer can confirm the room's starting stadium before commands.
         room.onStadiumChange = (newStadiumName, byPlayer) => {
             stadiumRandomizer.onStadiumChange(newStadiumName, byPlayer);
+            competition?.onStadiumChange(newStadiumName, byPlayer);
         };
         stadiumRandomizer.initializeStadium();
         room.setScoreLimit(0);
@@ -157,6 +162,13 @@ async function initializeRoom(token = null) {
             playerAuthMap: {}, // Map player.id -> { auth, name } (room.getPlayerList() doesn't include auth)
             finalScores: null, // Saved from onTeamVictory, null if draw/stopped early
         };
+
+        competition = eval(competitionFactorySource)({
+            room, randomizer: stadiumRandomizer,
+            getAuth: id => gameState.playerAuthMap[id]?.auth,
+            isRunning: () => gameState.isGameRunning || room.getScores?.() != null,
+        });
+        room.onPlayerTeamChange = (player, byPlayer) => competition.onPlayerTeamChange(player, byPlayer);
 
         // Admin management logic
         function updateAdmins() {
@@ -190,6 +202,11 @@ async function initializeRoom(token = null) {
         room.onPlayerJoin = (player) => {
             updateAdmins();
 
+            if (room.getPlayerList().length === 1) {
+                room.sendAnnouncement('👋 Witaj! Admin: !comp start — start zawodów dla 4 graczy (domyślnie z rewanżami).', player.id, 0xFFFFFF, 'normal', 1);
+                room.sendAnnouncement('⚙️ !comp mode single — bez rewanżów; !comp mode rematch — z rewanżami. Ustaw przed startem.', player.id, 0xFFFFFF, 'normal', 0);
+            }
+
             // Store player auth mapping (room.getPlayerList() doesn't include auth)
             if (player.auth) {
                 gameState.playerAuthMap[player.id] = {
@@ -208,6 +225,7 @@ async function initializeRoom(token = null) {
 
         // Player leave
         room.onPlayerLeave = (player) => {
+            competition.onPlayerLeave(player);
             updateAdmins();
 
             // Remove from auth mapping
@@ -224,6 +242,7 @@ async function initializeRoom(token = null) {
         room.onGameStart = (byPlayer) => {
             stadiumRandomizer.onGameStart();
             gameState.isGameRunning = true;
+            competition.onGameStart();
             goalAttribution.resetMatch();
             gameState.matchGoals = {};
             gameState.finalScores = { red: 0, blue: 0 }; // Initialize to 0:0 for draw tracking
@@ -248,6 +267,8 @@ async function initializeRoom(token = null) {
                         team: p.team,
                     };
                 });
+
+            gameState.startPlayers = players;
 
             // Initialize match goals tracker
             players.forEach(p => {
@@ -295,7 +316,7 @@ async function initializeRoom(token = null) {
             const allPlayers = room.getPlayerList();
 
             // Only include players with valid auth (use playerAuthMap)
-            const redPlayers = allPlayers
+            let redPlayers = allPlayers
                 .filter(p => p.team === 1 && gameState.playerAuthMap[p.id])
                 .map(p => {
                     const authData = gameState.playerAuthMap[p.id];
@@ -305,7 +326,7 @@ async function initializeRoom(token = null) {
                     };
                 });
 
-            const bluePlayers = allPlayers
+            let bluePlayers = allPlayers
                 .filter(p => p.team === 2 && gameState.playerAuthMap[p.id])
                 .map(p => {
                     const authData = gameState.playerAuthMap[p.id];
@@ -314,6 +335,11 @@ async function initializeRoom(token = null) {
                         name: p.name,
                     };
                 });
+
+            if (competition.isMatchActive()) {
+                redPlayers = gameState.startPlayers.filter(p => p.team === 1);
+                bluePlayers = gameState.startPlayers.filter(p => p.team === 2);
+            }
 
             // Announcement: Match ended
             room.sendAnnouncement('🏁 KONIEC MECZU!', null, 0xFFFFFF, 'bold', 2);
@@ -344,12 +370,15 @@ async function initializeRoom(token = null) {
             }
 
             if (window.statsOnGameStop) {
-                window.statsOnGameStop({
+                Promise.resolve(window.statsOnGameStop({
                     scoreRed: scores.red,
                     scoreBlue: scores.blue,
                     redPlayers,
                     bluePlayers,
-                });
+                })).catch(error => console.error("[Stats] Failed to save match:", error))
+                    .finally(() => competition.onGameStop());
+            } else {
+                competition.onGameStop();
             }
         };
 
@@ -447,6 +476,11 @@ async function initializeRoom(token = null) {
 
         // Player chat - handle commands
         room.onPlayerChat = (player, message) => {
+            const competitionResponse = competition.handleCommand(player, message);
+            if (competitionResponse !== null) {
+                room.sendAnnouncement(competitionResponse, null, 0xFFFFFF, "normal", 1);
+                return false;
+            }
             const randomizerResponse = stadiumRandomizer.handleCommand(player, message);
             if (randomizerResponse !== null) {
                 room.sendAnnouncement(`> ${message}`, null, 0xAAAAAA, "normal", 0);
@@ -499,6 +533,7 @@ async function initializeRoom(token = null) {
         randomizerFactorySource,
         randomizeDefinitionSource,
         getPhysicsSource,
+        competitionFactorySource,
     });
 
     updateState({ status_message: 'Room script executed. Waiting for room link...' });
