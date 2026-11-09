@@ -202,6 +202,11 @@ async function initializeRoom(token = null) {
         room.onPlayerJoin = (player) => {
             updateAdmins();
 
+            if (room.getPlayerList().length === 1) {
+                room.sendAnnouncement('👋 Witaj! Admin: !comp start — start zawodów dla 4 graczy (domyślnie z rewanżami).', player.id, 0xFFFFFF, 'normal', 1);
+                room.sendAnnouncement('⚙️ !comp mode single — bez rewanżów; !comp mode rematch — z rewanżami. Ustaw przed startem.', player.id, 0xFFFFFF, 'normal', 0);
+            }
+
             // Store player auth mapping (room.getPlayerList() doesn't include auth)
             if (player.auth) {
                 gameState.playerAuthMap[player.id] = {

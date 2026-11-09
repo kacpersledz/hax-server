@@ -29,7 +29,7 @@ these discrete values:
 
 | Property | Values |
 | --- | --- |
-| Kick multiplier | `1.10x`, `1.15x`, `1.20x`, `1.25x`, `1.30x` |
+| Kick multiplier | `1.10x`, `1.15x`, `1.20x`, `1.25x`, `1.30x`, `1.35x`, `1.40x` |
 | `kickStrength` | `5.5`, `5.75`, `6.0`, `6.25`, `6.5` (multiplier × HaxBall's standard value of `5`) |
 | Ball `damping` | `0.985`, `0.9875`, `0.990` |
 
