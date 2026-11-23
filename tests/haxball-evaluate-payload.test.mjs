@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { createDiagnostics } from '../diagnostics/buffer.mjs';
 import { createCompetition } from '../competition/controller.mjs';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -18,7 +19,7 @@ const source = readFileSync(new URL('../haxball.mjs', import.meta.url), 'utf8');
 test('haxball room script passes one payload object to page.evaluate', () => {
     assert.match(source, /page\.evaluate\(\(\{\s*config,\s*goalAttributionFactorySource,\s*stadiumSource,\s*builtinStadiums,\s*randomizerFactorySource,\s*randomizeDefinitionSource,\s*getPhysicsSource,/s);
     assert.match(source, /window\.HBInit\(config\)/);
-    assert.match(source, /\},\s*\{\s*config:\s*roomConfig,\s*goalAttributionFactorySource,\s*stadiumSource,\s*builtinStadiums,\s*randomizerFactorySource,\s*randomizeDefinitionSource,\s*getPhysicsSource,\s*competitionFactorySource,\s*\}\s*\);/s);
+    assert.match(source, /\},\s*\{\s*config:\s*roomConfig,\s*goalAttributionFactorySource,\s*stadiumSource,\s*builtinStadiums,\s*randomizerFactorySource,\s*randomizeDefinitionSource,\s*getPhysicsSource,\s*competitionFactorySource,\s*diagnosticsFactorySource,\s*\}\s*\);/s);
     assert.doesNotMatch(source, /page\.evaluate\(\(config,\s*goalAttributionFactorySource\)\s*=>/);
     assert.doesNotMatch(source, /\},\s*roomConfig,\s*goalAttributionFactorySource\s*\);/);
 });
@@ -41,6 +42,7 @@ function initializeWith(page, readStadium = readFile, window = {}) {
         readFile: readStadium,
         loadBuiltinStadiums,
         createGoalAttributionEngine,
+        createDiagnostics,
         createCompetition,
         createStadiumRandomizer,
         randomizeStadiumDefinition,
@@ -108,7 +110,7 @@ test('initialization loads the module-relative stadium in Node and selects it be
         async exposeFunction() {},
         async evaluate(callback, payload) {
             assert.deepEqual(Object.keys(payload).sort(), [
-                'builtinStadiums', 'competitionFactorySource', 'config', 'getPhysicsSource', 'goalAttributionFactorySource',
+                'builtinStadiums', 'competitionFactorySource', 'config', 'diagnosticsFactorySource', 'getPhysicsSource', 'goalAttributionFactorySource',
                 'randomizeDefinitionSource', 'randomizerFactorySource', 'stadiumSource',
             ]);
             assert.equal(payload.stadiumSource, stadiumSource);
@@ -184,4 +186,52 @@ test('stadium read failure reports the map and file and prevents room initializa
         assert.equal(error.cause, cause);
         return true;
     });
+});
+
+test('diagnostics are private, rate limited, and autosave the state before reset', async () => {
+    const announcements = [], reports = [];
+    const player = { id: 1, name: 'Player', team: 1 };
+    const room = {
+        setCustomStadium() {}, setScoreLimit() {}, setTimeLimit() {},
+        sendAnnouncement(message, target) { announcements.push({ message, target }); },
+        getPlayerList() { return [player]; }, getScores() { return { red: 1, blue: 0, time: 5 }; },
+        getBallPosition() { return { x: 0, y: 0 }; },
+        getDiscProperties() { return { x: 0, y: 0, radius: 10, xspeed: 1, yspeed: 2 }; },
+        getPlayerDiscProperties() { return { x: 0, y: 0, radius: 15, xspeed: 0, yspeed: 0 }; },
+    };
+    let fail = false;
+    const window = { HBInit: () => room, saveDiagnosticReport(report) {
+        if (fail) throw new Error('disk failure');
+        reports.push(report); return reports.length;
+    } };
+    await initializeWith({ async exposeFunction() {}, async evaluate(fn, payload) { fn(payload); } }, readFile, window);
+    room.onGameStart(null);
+    room.onPlayerBallKick(player);
+    room.onPositionsReset();
+    room.onGameTick();
+    // Opponent scoring after an attacker contact creates an unknown result, with contact still present.
+    room.onTeamGoal(2);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].trigger, 'auto');
+    assert.equal(reports[0].context.algorithm.currentTouch.playerId, 1);
+    assert.equal(reports[0].attributionDecisions[0].attribution.type, 'unknown');
+    assert.ok(reports[0].events.some(e => e.type === 'contact' && e.source === 'kick'));
+    assert.ok(reports[0].events.some(e => e.type === 'contact' && e.source === 'proximity'));
+    assert.equal(reports[0].snapshots.length, 1);
+    assert.doesNotMatch(JSON.stringify(reports[0]), /playerAuth|"auth"/);
+    const before = announcements.length;
+    assert.equal(room.onPlayerChat(player, '!save test'), false);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(reports.length, 2);
+    assert.equal(reports[1].trigger, 'manual');
+    assert.equal(reports[1].context.algorithm.currentTouch, null);
+    assert.deepEqual(announcements.slice(before), [{ message: 'Zapisano diagnostykę #2', target: 1 }]);
+    assert.equal(room.onPlayerChat(player, '!save again'), false);
+    assert.match(announcements.at(-1).message, /Odczekaj/);
+    fail = true;
+    assert.equal(room.onPlayerChat({ id: 2, name: 'Other' }, '!save error'), false);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(announcements.at(-1).target, 2);
+    assert.match(announcements.at(-1).message, /Nie udało/);
 });

@@ -222,7 +222,18 @@ export function createGoalAttributionEngine(options = {}) {
         return best ? { player: best.player, distance: best.distance } : null;
     }
 
-    return { resetMatch, resetPlay, recordTouch, resolveGoal, getTouches, selectClosestContact, config };
+    function getDebugState() {
+        const clean = touch => {
+            if (!touch) return null;
+            const { playerAuth, ...rest } = touch;
+            return { ...rest, position: rest.position ? { ...rest.position } : null };
+        };
+        return { currentTouch: clean(currentTouch), previousDifferentTouch: clean(previousDifferentTouch),
+            latestTouchByTeam: Object.fromEntries([...latestTouchByTeam].map(([team, touch]) => [team, clean(touch)])),
+            lastKickPlayerId, lastKickTimestamp, config: { ...config } };
+    }
+
+    return { resetMatch, resetPlay, recordTouch, resolveGoal, getTouches, getDebugState, selectClosestContact, config };
 }
 
 export class GoalAttributionEngine {
@@ -232,5 +243,6 @@ export class GoalAttributionEngine {
     recordTouch(touch) { return this.engine.recordTouch(touch); }
     resolveGoal(goal) { return this.engine.resolveGoal(goal); }
     getTouches() { return this.engine.getTouches(); }
+    getDebugState() { return this.engine.getDebugState(); }
     selectClosestContact(input) { return this.engine.selectClosestContact(input); }
 }
