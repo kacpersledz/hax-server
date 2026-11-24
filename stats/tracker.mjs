@@ -22,6 +22,11 @@ export class HaxballStatsTracker {
         // Initialize database schema
         this.db.initialize();
 
+        await this.page.exposeFunction('saveDiagnosticReport', report => {
+            try { return this.db.saveDiagnosticReport(report); }
+            catch (error) { console.error('[Diagnostics] Failed to save report:', error); throw error; }
+        });
+
         // Expose functions to browser context
         await this.page.exposeFunction('statsOnPlayerJoin', (auth, name) => {
             this.handlePlayerJoin(auth, name);

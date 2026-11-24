@@ -1,6 +1,6 @@
 # Database Migrations Guide
 
-## 📊 Current Schema Version: 1
+## 📊 Current Schema Version: 2
 
 This document describes all database migrations and provides examples for adding new ones.
 
@@ -16,6 +16,12 @@ Created initial database schema:
 - `matches` table - match history
 - `match_players` table - player performance per match
 - Indexes for performance optimization
+
+---
+
+### Migration 2 - Diagnostic reports
+
+Adds `diagnostic_reports`, with one JSON payload per report.
 
 ---
 
@@ -271,4 +277,4 @@ When deploying schema changes:
 ---
 
 **Last updated:** 2025-11-28
-**Schema version:** 1
+**Schema version:** 2

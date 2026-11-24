@@ -147,6 +147,18 @@ export class StatsDatabase {
             console.log('[DB] Migration 1 completed');
         }
 
+        if (currentVersion < 2) {
+            this.db.transaction(() => {
+                this.db.exec(`CREATE TABLE diagnostic_reports (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    trigger TEXT NOT NULL, comment TEXT, payload_json TEXT NOT NULL
+                )`);
+                this.db.exec('UPDATE schema_version SET version = 2');
+            })();
+            currentVersion = 2;
+        }
+
         // ========================================
         // FUTURE MIGRATIONS GO HERE
         // ========================================
@@ -172,6 +184,26 @@ export class StatsDatabase {
         // }
 
         console.log(`[DB] Schema up to date (version ${currentVersion})`);
+    }
+
+    saveDiagnosticReport(report) {
+        const json = JSON.stringify(report);
+        if (Buffer.byteLength(json, 'utf8') > 8 * 1024 * 1024) throw new Error('Diagnostic report exceeds 8 MiB');
+        return this.db.transaction(() => {
+            const result = this.db.prepare('INSERT INTO diagnostic_reports (trigger, comment, payload_json) VALUES (?, ?, ?)')
+                .run(report.trigger, report.comment, json);
+            this.db.prepare('DELETE FROM diagnostic_reports WHERE id NOT IN (SELECT id FROM diagnostic_reports ORDER BY id DESC LIMIT 100)').run();
+            return Number(result.lastInsertRowid);
+        })();
+    }
+
+    listDiagnosticReports() {
+        return this.db.prepare('SELECT id, created_at, trigger, comment FROM diagnostic_reports ORDER BY id DESC').all();
+    }
+
+    getDiagnosticReport(id) {
+        const row = this.db.prepare('SELECT payload_json FROM diagnostic_reports WHERE id = ?').get(id);
+        return row ? JSON.parse(row.payload_json) : null;
     }
 
     /**

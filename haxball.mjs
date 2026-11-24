@@ -1,3 +1,4 @@
+import { createDiagnostics } from "./diagnostics/buffer.mjs";
 import { createCompetition } from "./competition/controller.mjs";
 import { chromium } from "playwright";
 import { createHash } from "node:crypto";
@@ -108,6 +109,7 @@ async function initializeRoom(token = null) {
     }
     const builtinStadiums = await loadBuiltinStadiums();
 
+    const diagnosticsFactorySource = `(${createDiagnostics.toString()})`;
     const goalAttributionFactorySource = `(${createGoalAttributionEngine.toString()})`;
     const competitionFactorySource = `(${createCompetition.toString()})`;
     const randomizerFactorySource = `(${createStadiumRandomizer.toString()})`;
@@ -123,6 +125,7 @@ async function initializeRoom(token = null) {
         randomizeDefinitionSource,
         getPhysicsSource,
         competitionFactorySource,
+        diagnosticsFactorySource,
     }) => {
         const room = window.HBInit(config);
         const createGoalAttributionEngine = eval(goalAttributionFactorySource);
@@ -137,10 +140,19 @@ async function initializeRoom(token = null) {
             getPhysics: getStadiumPhysics,
             isGameRunning: () => gameState.isGameRunning || room.getScores?.() != null,
         });
+        const diagnostics = eval(diagnosticsFactorySource)();
+        const cooldowns = new Map();
+        const safeDiagnostic = fn => { try { return fn(); } catch (error) { console.error('[Diagnostics]', error); } };
+        const playerInfo = player => player ? { id: player.id, name: player.name, team: player.team } : null;
+        const event = (type, data = {}) => safeDiagnostic(() => diagnostics.event({ timestamp: Date.now(), matchTime: room.getScores?.()?.time ?? null, type, ...data }));
+        const context = () => ({ stadium: stadiumRandomizer.getState(), scores: room.getScores?.() ?? null,
+            algorithm: goalAttribution.getDebugState() });
+        const sendReport = report => Promise.resolve().then(() => window.saveDiagnosticReport(report));
         let competition;
         // Install the callback before the initial asynchronous setter so the
         // randomizer can confirm the room's starting stadium before commands.
         room.onStadiumChange = (newStadiumName, byPlayer) => {
+            event('stadiumChange', { stadium: newStadiumName, byPlayer: playerInfo(byPlayer) });
             stadiumRandomizer.onStadiumChange(newStadiumName, byPlayer);
             competition?.onStadiumChange(newStadiumName, byPlayer);
         };
@@ -168,7 +180,10 @@ async function initializeRoom(token = null) {
             getAuth: id => gameState.playerAuthMap[id]?.auth,
             isRunning: () => gameState.isGameRunning || room.getScores?.() != null,
         });
-        room.onPlayerTeamChange = (player, byPlayer) => competition.onPlayerTeamChange(player, byPlayer);
+        room.onPlayerTeamChange = (player, byPlayer) => {
+            event('playerTeamChange', { player: playerInfo(player), byPlayer: playerInfo(byPlayer) });
+            competition.onPlayerTeamChange(player, byPlayer);
+        };
 
         // Admin management logic
         function updateAdmins() {
@@ -186,7 +201,7 @@ async function initializeRoom(token = null) {
             const authData = gameState.playerAuthMap[player.id] || {};
             const ballPosition = position || room.getBallPosition();
             const scores = room.getScores();
-            return goalAttribution.recordTouch({
+            const touch = {
                 playerId: player.id,
                 playerAuth: authData.auth || null,
                 playerName: player.name,
@@ -195,11 +210,18 @@ async function initializeRoom(token = null) {
                 matchTime: scores?.time ?? null,
                 position: ballPosition ? { x: ballPosition.x, y: ballPosition.y } : null,
                 source,
-            });
+            };
+            const recorded = goalAttribution.recordTouch(touch);
+            if (recorded) {
+                const { playerAuth, ...publicTouch } = touch;
+                safeDiagnostic(() => diagnostics.event({ ...publicTouch, type: 'contact' }));
+            }
+            return recorded;
         }
 
         // Player join
         room.onPlayerJoin = (player) => {
+            event('playerJoin', { player: playerInfo(player) });
             updateAdmins();
 
             if (room.getPlayerList().length === 1) {
@@ -225,6 +247,8 @@ async function initializeRoom(token = null) {
 
         // Player leave
         room.onPlayerLeave = (player) => {
+            event('playerLeave', { player: playerInfo(player) });
+            cooldowns.delete(player.id);
             competition.onPlayerLeave(player);
             updateAdmins();
 
@@ -240,6 +264,7 @@ async function initializeRoom(token = null) {
 
         // Game start
         room.onGameStart = (byPlayer) => {
+            event('gameStart', { byPlayer: playerInfo(byPlayer) });
             stadiumRandomizer.onGameStart();
             gameState.isGameRunning = true;
             competition.onGameStart();
@@ -295,6 +320,7 @@ async function initializeRoom(token = null) {
 
         // Game stop
         room.onGameStop = (byPlayer) => {
+            event('gameStop', { byPlayer: playerInfo(byPlayer) });
             if (!gameState.isGameRunning) return;
             gameState.isGameRunning = false;
             goalAttribution.resetPlay();
@@ -402,6 +428,17 @@ async function initializeRoom(token = null) {
             if (scores) {
                 gameState.finalScores = scores; // Keep updating latest scores
             }
+            safeDiagnostic(() => {
+                const timestamp = Date.now();
+                const cleanPlayer = p => p ? { id: p.id, name: p.name, team: p.team } : null;
+                const decision = { ...attribution, scorer: cleanPlayer(scorer), assister: cleanPlayer(assister) };
+                diagnostics.event({ type: 'teamGoal', timestamp, matchTime: scores?.time ?? null, team, scores });
+                diagnostics.decision({ timestamp, matchTime: scores?.time ?? null, team, scores, attribution: decision });
+                if (attribution.type === 'unknown') {
+                    const report = diagnostics.report({ trigger: 'auto', timestamp, context: { ...context(), scoringTeam: team, reason: attribution.reason } });
+                    sendReport(report).catch(error => console.error('[Diagnostics] Autosave failed:', error));
+                }
+            });
             const scoreText = scores ? `🔴 Red ${scores.red} - ${scores.blue} Blue 🔵` : 'Score unavailable';
 
             // Announcement: Goal
@@ -457,6 +494,9 @@ async function initializeRoom(token = null) {
                     };
                 });
 
+            safeDiagnostic(() => diagnostics.sample({ timestamp, matchTime: room.getScores?.()?.time ?? null,
+                ball: ballDisc ? { x: ballDisc.x, y: ballDisc.y, xspeed: ballDisc.xspeed, yspeed: ballDisc.yspeed, radius: ballDisc.radius } : null,
+                players: players.map(p => ({ ...playerInfo(p), disc: p.disc ? { x: p.disc.x, y: p.disc.y, xspeed: p.disc.xspeed, yspeed: p.disc.yspeed, radius: p.disc.radius } : null })) }));
             const contact = goalAttribution.selectClosestContact({
                 ballPosition,
                 ballRadius,
@@ -471,11 +511,31 @@ async function initializeRoom(token = null) {
 
         // Positions reset after a goal or manual reset: start fresh for the next play.
         room.onPositionsReset = () => {
+            event('positionsReset');
             goalAttribution.resetPlay();
         };
 
         // Player chat - handle commands
         room.onPlayerChat = (player, message) => {
+            const saveMatch = /^!save(?:\s|$)/i.exec(message.trim());
+            if (saveMatch) {
+                const now = Date.now();
+                if (cooldowns.has(player.id) && now - cooldowns.get(player.id) < 30000) {
+                    room.sendAnnouncement('Odczekaj 30 sekund przed kolejnym zgłoszeniem.', player.id, 0xFFFFFF, 'normal', 0);
+                    return false;
+                }
+                cooldowns.set(player.id, now);
+                const comment = message.trim().slice(saveMatch[0].length).trim().slice(0, 500);
+                const report = safeDiagnostic(() => diagnostics.report({ trigger: 'manual', timestamp: now, comment,
+                    context: { ...context(), reporter: playerInfo(player) } }));
+                Promise.resolve().then(() => {
+                    if (!report) throw new Error('Could not prepare report');
+                    return sendReport(report);
+                }).then(id => room.sendAnnouncement(`Zapisano diagnostykę #${id}`, player.id, 0xFFFFFF, 'normal', 0))
+                    .catch(error => { console.error('[Diagnostics] Manual save failed:', error);
+                        room.sendAnnouncement('Nie udało się zapisać diagnostyki.', player.id, 0xFFFFFF, 'normal', 0); });
+                return false;
+            }
             const competitionResponse = competition.handleCommand(player, message);
             if (competitionResponse !== null) {
                 room.sendAnnouncement(competitionResponse, null, 0xFFFFFF, "normal", 1);
@@ -534,6 +594,7 @@ async function initializeRoom(token = null) {
         randomizeDefinitionSource,
         getPhysicsSource,
         competitionFactorySource,
+        diagnosticsFactorySource,
     });
 
     updateState({ status_message: 'Room script executed. Waiting for room link...' });
