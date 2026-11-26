@@ -24,7 +24,7 @@ const submit = (e, entry, options = {}) => {
     if (entry.source === 'kick') return e.recordTouch(entry);
     return e.observeTick({
         timestamp: entry.timestamp,
-        contact: { id: entry.playerId, name: entry.playerName, team: entry.playerTeam },
+        contact: { id: entry.playerId, playerAuth: entry.playerAuth, name: entry.playerName, team: entry.playerTeam },
         contactCandidateIds: options.candidateIds ?? [entry.playerId],
         ballPosition: options.ballPosition ?? { x: 0, y: 0 },
         ballVelocity: options.ballVelocity ?? null,
@@ -32,11 +32,27 @@ const submit = (e, entry, options = {}) => {
 };
 const tick = (e, timestamp, player = null, ballVelocity = null, candidateIds, playerPosition = { x: 0, y: 0 }) => e.observeTick({
     timestamp,
-    contact: player ? { id: player.playerId, name: player.playerName, team: player.playerTeam } : null,
+    contact: player ? { id: player.playerId, playerAuth: player.playerAuth, name: player.playerName, team: player.playerTeam } : null,
     contactCandidateIds: candidateIds ?? (player ? [player.playerId] : []),
     contactCandidateStates: player ? [{ id: player.playerId, ...playerPosition }] : [],
     ballPosition: { x: 0, y: 0 },
     ballVelocity,
+});
+
+test('auth remains callback data only and is absent from debug surfaces and logs', () => {
+    const e = new GoalAttributionEngine({ diagnostics: true });
+    const logs = [];
+    const originalLog = console.log;
+    console.log = (...args) => logs.push(args);
+    let result;
+    try {
+        submit(e, touch(P.A, 1000));
+        result = e.resolveGoal({ scoringTeam: RED });
+    } finally {
+        console.log = originalLog;
+    }
+    assert.equal(result.scorer.auth, P.A.playerAuth, 'auth remains available to statsOnTeamGoal');
+    assert.doesNotMatch(JSON.stringify([e.getDebugState(), e.getTouches(), logs]), /auth-a|playerAuth|"auth"/);
 });
 
 test('direct goal without assist', () => {
@@ -60,6 +76,157 @@ test('simple assist uses the previous different scoring-team player', () => {
     assert.equal(result.scorer.name, 'B');
     assert.equal(result.assister.name, 'A');
     assert.equal(result.assistReason, 'assist-found');
+});
+
+test('confirmed continuous contact refreshes the same passer assist window after a long dribble', () => {
+    const e = engine();
+    submit(e, touch(P.A, 1000));
+    let timestamp = 1016;
+    for (let i = 0; i < 360; i++, timestamp += 16) tick(e, timestamp, P.A, { x: 0, y: 0 });
+    const lastJustified = e.getDebugState().responsibleTouch.lastJustifiedTimestamp;
+    assert.ok(lastJustified > 6000, 'the long continuous session refreshes justified contact time');
+    submit(e, touch(P.B, timestamp + 1000));
+    const result = e.resolveGoal({ scoringTeam: RED });
+
+    assert.equal(result.scorer.name, 'B');
+    assert.equal(result.assister.name, 'A');
+    assert.equal(result.assistReason, 'assist-found');
+});
+
+test('an accepted redirection refreshes the current owner, but weak contacts and long gaps do not', () => {
+    const redirected = engine();
+    submit(redirected, touch(P.A, 1000));
+    tick(redirected, 1016, null, { x: 0.5, y: 0 });
+    tick(redirected, 3000, P.A, { x: 0.5, y: 0 }, [P.A.playerId], { x: 2, y: 0 });
+    tick(redirected, 3016, P.A, { x: -0.5, y: 0 }, [P.A.playerId], { x: 0, y: 0 });
+    assert.equal(redirected.getDebugState().responsibleTouch.responsibilityTimestamp, 1000);
+    assert.equal(redirected.getDebugState().responsibleTouch.lastJustifiedTimestamp, 3016);
+    submit(redirected, touch(P.B, 6000));
+    let result = redirected.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.assister.name, 'A', 'accepted redirect extends the passer window');
+
+    const weakContactDoesNotRefresh = engine();
+    submit(weakContactDoesNotRefresh, touch(P.A, 1000));
+    submit(weakContactDoesNotRefresh, touch(P.A, 6000, 'proximity'));
+    submit(weakContactDoesNotRefresh, touch(P.B, 6200));
+    result = weakContactDoesNotRefresh.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.assister, null);
+    assert.equal(result.assistReason, 'assist-expired');
+
+    const confirmedGapDoesNotRefresh = engine();
+    submit(confirmedGapDoesNotRefresh, touch(P.A, 1000));
+    for (let timestamp = 1016; timestamp <= 1312; timestamp += 16) tick(confirmedGapDoesNotRefresh, timestamp, P.A);
+    const lastJustified = confirmedGapDoesNotRefresh.getDebugState().responsibleTouch.lastJustifiedTimestamp;
+    assert.ok(lastJustified > 1000);
+    submit(confirmedGapDoesNotRefresh, touch(P.B, lastJustified + 3001));
+    result = confirmedGapDoesNotRefresh.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.assister, null);
+    assert.equal(result.assistReason, 'assist-expired');
+});
+
+test('weak opponent contact breaks assist chains until a new justified passer contact', () => {
+    const beforeTakeover = engine();
+    submit(beforeTakeover, touch(P.A, 1000));
+    submit(beforeTakeover, touch(P.D, 1100, 'proximity'));
+    submit(beforeTakeover, touch(P.B, 1200));
+    let result = beforeTakeover.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.scorer.name, 'B');
+    assert.equal(result.assister, null);
+    assert.equal(result.assistReason, 'assist-blocked-by-opponent-contact');
+
+    const afterTakeover = engine();
+    submit(afterTakeover, touch(P.A, 1000));
+    submit(afterTakeover, touch(P.B, 1100));
+    submit(afterTakeover, touch(P.D, 1200, 'proximity'));
+    result = afterTakeover.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.scorer.name, 'B');
+    assert.equal(result.assister, null);
+    assert.equal(result.assistReason, 'assist-blocked-by-opponent-contact');
+
+    const weakSameOwnerDoesNotRestore = engine();
+    submit(weakSameOwnerDoesNotRestore, touch(P.A, 1000));
+    submit(weakSameOwnerDoesNotRestore, touch(P.D, 1100, 'proximity'));
+    submit(weakSameOwnerDoesNotRestore, touch(P.A, 1150, 'proximity'));
+    submit(weakSameOwnerDoesNotRestore, touch(P.B, 1200));
+    result = weakSameOwnerDoesNotRestore.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.assister, null);
+
+    const justifiedPassAfterContact = engine();
+    submit(justifiedPassAfterContact, touch(P.A, 1000));
+    submit(justifiedPassAfterContact, touch(P.D, 1100, 'proximity'));
+    submit(justifiedPassAfterContact, touch(P.A, 1150));
+    submit(justifiedPassAfterContact, touch(P.B, 1200));
+    result = justifiedPassAfterContact.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.assister.name, 'A');
+    assert.equal(result.assistReason, 'assist-found');
+});
+
+test('weak fallback uses the latest single observed contact without changing responsibility', () => {
+    const noOwner = engine();
+    tick(noOwner, 1000, P.D);
+    tick(noOwner, 1100, P.A);
+    const result = noOwner.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.type, 'goal');
+    assert.equal(result.scorer.name, 'A');
+    assert.equal(result.scorer.auth, P.A.playerAuth);
+    assert.equal(result.assister, null);
+    assert.equal(result.confidence, 'low');
+    assert.equal(result.reason, 'fallback-weak-contact');
+    assert.equal(result.candidateEvidence.reason, 'fallback-weak-contact');
+    assert.equal(result.assistReason, 'no-assist-candidate');
+
+    const opponentFallback = engine();
+    tick(opponentFallback, 1000, P.D);
+    const ownGoal = opponentFallback.resolveGoal({ scoringTeam: RED });
+    assert.equal(ownGoal.type, 'own_goal');
+    assert.equal(ownGoal.scorer.name, 'D');
+    assert.equal(ownGoal.confidence, 'low');
+
+    const ambiguous = engine();
+    tick(ambiguous, 1000, P.D, null, [P.D.playerId, P.A.playerId]);
+    assert.equal(ambiguous.getDebugState().weakCandidate, null);
+    assert.equal(ambiguous.resolveGoal({ scoringTeam: RED }).type, 'unknown');
+
+    const retainedAcrossBreak = engine();
+    tick(retainedAcrossBreak, 1000, P.D);
+    retainedAcrossBreak.breakContinuity('test-pause');
+    tick(retainedAcrossBreak, 5000, null);
+    assert.equal(retainedAcrossBreak.resolveGoal({ scoringTeam: RED }).scorer.name, 'D');
+    retainedAcrossBreak.resetPlay();
+    assert.equal(retainedAcrossBreak.resolveGoal({ scoringTeam: RED }).type, 'unknown');
+
+    const ownerWins = engine();
+    submit(ownerWins, touch(P.A, 1000));
+    tick(ownerWins, 1100, P.D);
+    const ownedGoal = ownerWins.resolveGoal({ scoringTeam: RED });
+    assert.equal(ownedGoal.scorer.name, 'A');
+    assert.equal(ownedGoal.confidence, 'high');
+});
+
+test('direction changes require minimum vector delta while large speed changes remain eligible', () => {
+    const redirect = (beforeSpeed, afterSpeed, previousPosition, currentPosition) => {
+        const e = engine();
+        tick(e, 1000, P.A, { x: beforeSpeed, y: 0 }, [P.A.playerId], previousPosition);
+        tick(e, 1016, P.A, { x: afterSpeed, y: 0 }, [P.A.playerId], currentPosition);
+        return e;
+    };
+
+    const tinyTurn = redirect(0.11, -0.11, { x: 1, y: 0 }, { x: 0, y: 0 });
+    assert.equal(tinyTurn.getDebugState().responsibleTouch, null);
+    assert.equal(tinyTurn.getDebugState().lastEvidence.reason, 'direction-change-below-minimum-delta');
+    assert.equal(tinyTurn.getDebugState().lastEvidence.deltaSpeedVector, 0.22);
+
+    const belowThreshold = redirect(0.495, -0.495, { x: 2, y: 0 }, { x: 0, y: 0 });
+    assert.equal(belowThreshold.getDebugState().responsibleTouch, null);
+    assert.equal(belowThreshold.getDebugState().lastEvidence.reason, 'direction-change-below-minimum-delta');
+
+    const atThreshold = redirect(0.5, -0.5, { x: 2, y: 0 }, { x: 0, y: 0 });
+    assert.equal(atThreshold.getDebugState().responsibleTouch.playerId, P.A.playerId);
+    assert.equal(atThreshold.resolveGoal({ scoringTeam: RED }).candidateEvidence.reason, 'velocity-direction-change');
+
+    const largeDeltaNoTurn = redirect(1, 4, { x: 0, y: 0 }, { x: 2, y: 0 });
+    assert.equal(largeDeltaNoTurn.getDebugState().responsibleTouch.playerId, P.A.playerId);
+    assert.equal(largeDeltaNoTurn.resolveGoal({ scoringTeam: RED }).candidateEvidence.reason, 'velocity-change');
 });
 
 test('repeated scorer touches do not destroy an assist', () => {
@@ -125,7 +292,7 @@ test('an attacker kick in the same unresolved interval as defender proximity sta
     assert.deepEqual(result.evidence.kickPlayerIds, [P.A.playerId]);
 });
 
-test('latest attacker before a defender proximity scores without an assist across the deflection', () => {
+test('latest attacker before a weak defender proximity scores without an assist across the deflection', () => {
     const e = engine();
     submit(e, touch(P.A, 1000));
     submit(e, touch(P.B, 1200));
@@ -134,7 +301,8 @@ test('latest attacker before a defender proximity scores without an assist acros
 
     assert.equal(result.type, 'goal');
     assert.equal(result.scorer.name, 'B');
-    assert.equal(result.assister.name, 'A');
+    assert.equal(result.assister, null);
+    assert.equal(result.assistReason, 'assist-blocked-by-opponent-contact');
     assert.equal(result.isOwnGoal, false);
 });
 
@@ -193,7 +361,7 @@ test('an old defender kick remains an own goal when proximity follows', () => {
     assert.equal(result.reason, 'opponent-kick-own-goal');
 });
 
-test('an insignificant opponent proximity does not create an assist boundary', () => {
+test('one weak opponent proximity tick creates an assist boundary', () => {
     const e = engine();
     submit(e, touch(P.A, 1000));
     submit(e, touch(P.D, 1200, 'proximity'));
@@ -201,8 +369,8 @@ test('an insignificant opponent proximity does not create an assist boundary', (
     const result = e.resolveGoal({ scoringTeam: RED, timestamp: 1600 });
 
     assert.equal(result.scorer.name, 'B');
-    assert.equal(result.assister.name, 'A');
-    assert.equal(result.assistReason, 'assist-found');
+    assert.equal(result.assister, null);
+    assert.equal(result.assistReason, 'assist-blocked-by-opponent-contact');
 });
 
 test('an explicit kick after proximity creates a distinct takeover time', () => {
@@ -321,6 +489,9 @@ test('sustained contact can qualify when physics samples are missing', () => {
     assert.equal(result.type, 'own_goal');
     assert.equal(result.scorer.name, 'D');
     assert.match(result.reason, /sustained-contact/);
+    assert.equal(result.responsibilityTimestamp, 1100);
+    assert.ok(result.candidateEvidence.lastJustifiedTimestamp > result.responsibilityTimestamp,
+        'the first sustained takeover uses the session start for ownership and the confirmed tick for justification');
 });
 
 test('sustained proximity by the current kicker changes evidence confidence without changing takeover time', () => {
@@ -529,14 +700,16 @@ test('team identity is snapshotted at touch time', () => {
     assert.equal(result.scorer.team, RED);
 });
 
-test('an opponent proximity touch without a recent scoring-team touch stays unknown', () => {
+test('a single opponent proximity touch is a low-confidence own-goal fallback', () => {
     const e = engine();
     submit(e, touch(P.D, 1000, 'proximity'));
     const result = e.resolveGoal({ scoringTeam: RED, timestamp: 1200 });
 
-    assert.equal(result.type, 'unknown');
-    assert.equal(result.scorer, null);
-    assert.equal(result.isOwnGoal, false);
+    assert.equal(result.type, 'own_goal');
+    assert.equal(result.scorer.name, 'D');
+    assert.equal(result.confidence, 'low');
+    assert.equal(result.reason, 'fallback-weak-contact');
+    assert.equal(result.isOwnGoal, true);
 });
 
 test('assist window is measured from passer touch to scorer touch', () => {

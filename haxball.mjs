@@ -490,6 +490,7 @@ async function initializeRoom(token = null) {
                     const disc = room.getPlayerDiscProperties(player.id);
                     return {
                         ...player,
+                        playerAuth: gameState.playerAuthMap[player.id]?.auth ?? null,
                         disc,
                         playerRadius: disc?.radius,
                     };

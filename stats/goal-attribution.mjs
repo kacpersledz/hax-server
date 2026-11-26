@@ -8,6 +8,7 @@ export function createGoalAttributionEngine(options = {}) {
         significantContactMs: 300,
         significantSpeedChange: 2.5,
         significantTurnRadians: Math.PI / 4,
+        minDirectionalDelta: 1.0,
         diagnostics: false,
     };
     const config = { ...DEFAULTS, ...options };
@@ -18,6 +19,9 @@ export function createGoalAttributionEngine(options = {}) {
     let pendingKicks = [];
     let lastEvidence = { reason: 'no-physics-observation', accepted: false };
     let responsibleEvidence = null;
+    let weakCandidate = null;
+    let observationSequence = 0;
+    let lastOpponentContactSequenceByTeam = new Map();
     let latestTouchByTeam = new Map();
     let lastKickPlayerId = null;
     let lastKickTimestamp = 0;
@@ -28,11 +32,33 @@ export function createGoalAttributionEngine(options = {}) {
     const samePlayer = (a, b) => !!a && !!b && a.playerId === b.playerId;
     const velocity = value => value && Number.isFinite(value.x) && Number.isFinite(value.y) ? { x: value.x, y: value.y } : null;
     const publicPlayer = touch => touch ? ({ id: touch.playerId, auth: touch.playerAuth || null, name: touch.playerName, team: touch.playerTeam }) : null;
+    const diagnosticPlayer = player => {
+        if (!player) return null;
+        const { auth, playerAuth, ...safe } = player;
+        return safe;
+    };
     const withoutAuth = touch => {
         if (!touch) return null;
-        const { playerAuth, ...safe } = touch;
+        const { auth, playerAuth, ...safe } = touch;
         return { ...safe, position: safe.position ? { ...safe.position } : null };
     };
+    function noteWeakCandidate(touch, sequence, candidateIds = [touch.playerId]) {
+        weakCandidate = {
+            ...touch,
+            lastEvidenceReason: 'fallback-weak-contact',
+            confidence: 'low',
+            candidateEvidence: {
+                reason: 'fallback-weak-contact', accepted: false, playerId: touch.playerId,
+                contactTimestamp: touch.timestamp, observationSequence: sequence,
+                candidateIds: [...candidateIds],
+            },
+        };
+    }
+    function noteAssistBoundary(contact, sequence, timestamp) {
+        const scoringTeam = contact.playerTeam === 1 ? 2 : contact.playerTeam === 2 ? 1 : null;
+        if (scoringTeam == null) return;
+        lastOpponentContactSequenceByTeam.set(scoringTeam, { sequence, timestamp, playerId: contact.playerId });
+    }
     const normalizeTouch = input => ({
         playerId: input.playerId,
         playerAuth: input.playerAuth || null,
@@ -47,15 +73,21 @@ export function createGoalAttributionEngine(options = {}) {
         source: input.source === 'kick' ? 'kick' : 'proximity',
     });
     function assignResponsibility(touch, takeoverTimestamp, reason, evidenceConfidence = 'medium', evidenceDetails = null) {
+        const justifiedTimestamp = Number.isFinite(evidenceDetails?.lastJustifiedTimestamp)
+            ? evidenceDetails.lastJustifiedTimestamp
+            : Number.isFinite(touch.lastJustifiedTimestamp) ? touch.lastJustifiedTimestamp : takeoverTimestamp;
+        const justifiedSequence = Number.isFinite(evidenceDetails?.observationSequence)
+            ? evidenceDetails.observationSequence : observationSequence;
         const acceptedEvidence = evidenceDetails || { reason, accepted: true, playerId: touch.playerId, takeoverTimestamp };
         const previous = responsibleTouch;
         if (samePlayer(previous, touch)) {
-            // A repeated kick is a new justified contact for later assist-window
-            // checks, but ordinary continued proximity does not refresh it.
+            // Keep the original takeover timestamp, but refresh the assist
+            // window whenever this player makes a newly justified contact.
+            previous.lastJustifiedTimestamp = justifiedTimestamp;
+            previous.lastJustifiedSequence = justifiedSequence;
+            previous.timestamp = justifiedTimestamp;
+            previous.lastTouchTimestamp = justifiedTimestamp;
             if (reason === 'explicit-kick') {
-                previous.lastJustifiedTimestamp = takeoverTimestamp;
-                previous.timestamp = takeoverTimestamp;
-                previous.lastTouchTimestamp = takeoverTimestamp;
                 previous.lastKickTimestamp = takeoverTimestamp;
             }
             previous.lastEvidenceReason = reason;
@@ -63,14 +95,16 @@ export function createGoalAttributionEngine(options = {}) {
             previous.confidence = evidenceConfidence;
             responsibleEvidence = { ...acceptedEvidence };
             latestTouchByTeam.set(previous.playerTeam, previous);
-            lastEvidence = { ...lastEvidence, accepted: true, reason, playerId: previous.playerId, takeoverTimestamp };
+            lastEvidence = { ...lastEvidence, accepted: true, reason, playerId: previous.playerId,
+                takeoverTimestamp: previous.responsibilityTimestamp, lastJustifiedTimestamp: justifiedTimestamp };
             return;
         }
         previousDifferentTouch = previous ? { ...previous } : null;
         responsibleTouch = {
             ...touch,
             responsibilityTimestamp: takeoverTimestamp,
-            lastJustifiedTimestamp: takeoverTimestamp,
+            lastJustifiedTimestamp: justifiedTimestamp,
+            lastJustifiedSequence: justifiedSequence,
             lastEvidenceReason: reason,
             confidence: evidenceConfidence,
         };
@@ -80,6 +114,7 @@ export function createGoalAttributionEngine(options = {}) {
     }
     function recordTouch(input) {
         if (!input || input.playerTeam === 0 || input.playerId == null || !Number.isFinite(input.timestamp)) return false;
+        const sequence = ++observationSequence;
         const touch = normalizeTouch(input);
         if (touch.source === 'kick') {
             lastKickPlayerId = touch.playerId;
@@ -88,13 +123,17 @@ export function createGoalAttributionEngine(options = {}) {
             // A kick is an instantaneous attribution event, not evidence that a
             // proximity session before/after it was continuous.
             contactSession = null;
+            noteAssistBoundary(touch, sequence, touch.timestamp);
             assignResponsibility(touch, touch.timestamp, 'explicit-kick', 'high', {
                 reason: 'explicit-kick', accepted: true, playerId: touch.playerId,
                 takeoverTimestamp: touch.timestamp, kickTimestamp: touch.timestamp,
+                lastJustifiedTimestamp: touch.timestamp, observationSequence: sequence,
             });
         } else {
             // Compatibility path for callers which still submit a point contact.
             // It cannot establish duration or a trustworthy velocity interval.
+            noteWeakCandidate(touch, sequence);
+            noteAssistBoundary(touch, sequence, touch.timestamp);
             lastEvidence = { reason: 'proximity-event-without-continuity', accepted: false, playerId: touch.playerId,
                 data: 'duration-and-interval-evidence-required' };
         }
@@ -116,9 +155,10 @@ export function createGoalAttributionEngine(options = {}) {
     function observeTick({ timestamp, contact = null, contactCandidateIds, contactCandidateStates,
         ballVelocity: rawVelocity, ballPosition } = {}) {
         if (!Number.isFinite(timestamp)) {
-            lastEvidence = { reason: 'invalid-tick-timestamp', accepted: false };
+            breakContinuity('invalid-tick-timestamp');
             return false;
         }
+        const sequence = ++observationSequence;
         const currentVelocity = velocity(rawVelocity);
         const normalizedContact = contact && contact.team !== 0
             ? normalizeTouch({
@@ -134,6 +174,12 @@ export function createGoalAttributionEngine(options = {}) {
         const candidateIds = Array.isArray(contactCandidateIds)
             ? [...new Set(contactCandidateIds.filter(id => id != null))].sort((a, b) => a - b)
             : normalizedContact ? [normalizedContact.playerId] : [];
+        const unambiguousContact = !!normalizedContact && candidateIds.length === 1 &&
+            candidateIds[0] === normalizedContact.playerId;
+        if (unambiguousContact) {
+            noteWeakCandidate(normalizedContact, sequence, candidateIds);
+            noteAssistBoundary(normalizedContact, sequence, timestamp);
+        }
         const candidateStates = Array.isArray(contactCandidateStates) ? contactCandidateStates :
             contact?.disc ? [{ id: contact.id ?? contact.playerId, x: contact.disc.x, y: contact.disc.y }] : [];
         const gap = lastObservation ? timestamp - lastObservation.timestamp : null;
@@ -184,8 +230,9 @@ export function createGoalAttributionEngine(options = {}) {
                 };
             } else if (contactSession.durationMs >= config.significantContactMs && !contactSession.ambiguous) {
                 const acceptedEvidence = { reason: 'sustained-contact', accepted: true, playerId: normalizedContact.playerId,
-                    durationMs: contactSession.durationMs, sessionTicks: contactSession.tickCount, intervalGapMs: gap };
-                const evidence = contactEvidence(normalizedContact, acceptedEvidence.reason, contactSession.startTimestamp, contactSession.durationMs);
+                    durationMs: contactSession.durationMs, sessionTicks: contactSession.tickCount, intervalGapMs: gap,
+                    lastJustifiedTimestamp: timestamp, observationSequence: sequence };
+                const evidence = contactEvidence(normalizedContact, acceptedEvidence.reason, timestamp, contactSession.durationMs);
                 assignResponsibility(evidence, contactSession.startTimestamp, acceptedEvidence.reason, 'medium', acceptedEvidence);
                 lastEvidence = acceptedEvidence;
             } else if (contactSession.ambiguous) {
@@ -206,7 +253,10 @@ export function createGoalAttributionEngine(options = {}) {
                 const angleRadians = beforeSpeed > 0.1 && afterSpeed > 0.1
                     ? Math.acos(Math.max(-1, Math.min(1, dot / (beforeSpeed * afterSpeed)))) : 0;
                 const delta = Math.hypot(after.x - before.x, after.y - before.y);
-                const strong = delta >= config.significantSpeedChange || angleRadians >= config.significantTurnRadians;
+                const largeDirectionChange = angleRadians >= config.significantTurnRadians;
+                const strongDelta = delta >= config.significantSpeedChange;
+                const strongDirectionChange = largeDirectionChange && delta >= config.minDirectionalDelta;
+                const strong = strongDelta || strongDirectionChange;
                 if (strong) {
                     const playerDx = candidateStates[0].x - lastObservation.candidateStates[0].x;
                     const playerDy = candidateStates[0].y - lastObservation.candidateStates[0].y;
@@ -217,21 +267,27 @@ export function createGoalAttributionEngine(options = {}) {
                     if (sourceAlignment < 0.5) {
                         lastEvidence = { reason: 'velocity-source-ambiguous', accepted: false,
                             playerId: normalizedContact.playerId, deltaSpeedVector: delta, angleRadians,
-                            playerMotion, sourceAlignment, intervalGapMs: gap, contactCandidateIds: candidateIds };
+                            playerMotion, sourceAlignment, intervalGapMs: gap, contactCandidateIds: candidateIds,
+                            minDirectionalDelta: config.minDirectionalDelta };
                     } else {
-                        const reason = angleRadians >= config.significantTurnRadians
+                        const reason = largeDirectionChange && delta >= config.minDirectionalDelta
                             ? 'velocity-direction-change' : 'velocity-change';
                         const acceptedEvidence = { reason, accepted: true, playerId: normalizedContact.playerId,
                             deltaSpeedVector: delta, angleRadians, playerMotion, sourceAlignment,
-                            intervalGapMs: gap, contactCandidateIds: candidateIds };
+                            intervalGapMs: gap, contactCandidateIds: candidateIds,
+                            minDirectionalDelta: config.minDirectionalDelta,
+                            lastJustifiedTimestamp: timestamp, observationSequence: sequence };
                         const evidence = contactEvidence(normalizedContact, reason, timestamp, contactSession.durationMs);
                         assignResponsibility(evidence, timestamp, reason, 'medium', acceptedEvidence);
                         lastEvidence = acceptedEvidence;
                     }
                 } else {
-                    lastEvidence = { reason: 'velocity-change-below-threshold', accepted: false,
+                    const reason = largeDirectionChange && delta < config.minDirectionalDelta
+                        ? 'direction-change-below-minimum-delta' : 'velocity-change-below-threshold';
+                    lastEvidence = { reason, accepted: false,
                         playerId: normalizedContact.playerId, deltaSpeedVector: delta, angleRadians, intervalGapMs: gap,
-                        contactCandidateIds: candidateIds };
+                        contactCandidateIds: candidateIds, minDirectionalDelta: config.minDirectionalDelta,
+                        significantSpeedChange: config.significantSpeedChange };
                 }
             }
         }
@@ -250,6 +306,10 @@ export function createGoalAttributionEngine(options = {}) {
         if (!candidate) return { assister: null, reason: 'no-assist-candidate' };
         if (candidate.playerTeam !== scorer.playerTeam) return { assister: null, reason: 'assist-blocked-by-opponent' };
         if (samePlayer(candidate, scorer)) return { assister: null, reason: 'no-assist-candidate' };
+        const opponentBoundary = lastOpponentContactSequenceByTeam.get(scorer.playerTeam);
+        if (opponentBoundary && opponentBoundary.sequence > (candidate.lastJustifiedSequence ?? -Infinity)) {
+            return { assister: null, reason: 'assist-blocked-by-opponent-contact' };
+        }
         const elapsed = scorer.responsibilityTimestamp - candidate.lastJustifiedTimestamp;
         if (elapsed < 0) return { assister: null, reason: 'assist-negative-interval' };
         if (elapsed > config.assistTimeWindowMs) return { assister: null, reason: 'assist-expired' };
@@ -266,15 +326,26 @@ export function createGoalAttributionEngine(options = {}) {
             responsibilityTimestamp: scorer.responsibilityTimestamp, evidence: { ...lastEvidence },
             candidateEvidence: responsibleEvidence ? { ...responsibleEvidence } : null, assistReason: assist.reason };
     }
+    function makeWeakFallbackResult(scoringTeam) {
+        const own = weakCandidate.playerTeam !== scoringTeam;
+        return {
+            type: own ? 'own_goal' : 'goal', scorer: publicPlayer(weakCandidate), assister: null,
+            isOwnGoal: own, confidence: 'low', reason: 'fallback-weak-contact',
+            candidateReason: 'fallback-weak-contact', responsibilityTimestamp: null,
+            evidence: { ...lastEvidence }, candidateEvidence: { ...weakCandidate.candidateEvidence },
+            assistReason: 'no-assist-candidate',
+        };
+    }
     function resolveGoal({ scoringTeam }) {
         let result;
-        if (!responsibleTouch) result = makeResult('goal', null, scoringTeam, 'no-attribution-candidate', 'low');
+        if (!responsibleTouch && weakCandidate) result = makeWeakFallbackResult(scoringTeam);
+        else if (!responsibleTouch) result = makeResult('goal', null, scoringTeam, 'no-attribution-candidate', 'low');
         else if (responsibleTouch.playerTeam === scoringTeam) result = makeResult('goal', responsibleTouch, scoringTeam,
             'last-touch-scoring-team', responsibleTouch.source === 'kick' ? 'high' : responsibleTouch.confidence || 'medium');
         else if (responsibleTouch.source === 'kick') result = makeResult('own_goal', responsibleTouch, scoringTeam, 'opponent-kick-own-goal', 'high');
         else result = makeResult('own_goal', responsibleTouch, scoringTeam,
             `significant-opponent-contact:${responsibleTouch.lastEvidenceReason}`, 'medium');
-        debug('goal', result, getDebugState());
+        debug('goal', { ...result, scorer: diagnosticPlayer(result.scorer), assister: diagnosticPlayer(result.assister) }, getDebugState());
         return result;
     }
     function resetPlay() {
@@ -285,6 +356,9 @@ export function createGoalAttributionEngine(options = {}) {
         pendingKicks = [];
         lastEvidence = { reason: 'play-reset', accepted: false };
         responsibleEvidence = null;
+        weakCandidate = null;
+        observationSequence = 0;
+        lastOpponentContactSequenceByTeam = new Map();
         latestTouchByTeam = new Map();
         lastKickPlayerId = null;
         lastKickTimestamp = 0;
@@ -297,8 +371,7 @@ export function createGoalAttributionEngine(options = {}) {
     }
     function resetMatch() { resetPlay(); }
     function getTouches() {
-        return [previousDifferentTouch, responsibleTouch].filter(Boolean)
-            .map(touch => ({ ...touch, position: touch.position ? { ...touch.position } : null }));
+        return [previousDifferentTouch, responsibleTouch].filter(Boolean).map(withoutAuth);
     }
     function selectClosestContact({ ballPosition, ballRadius, players, timestamp }) {
         if (!ballPosition || !Number.isFinite(ballPosition.x) || !Number.isFinite(ballPosition.y) ||
@@ -330,6 +403,8 @@ export function createGoalAttributionEngine(options = {}) {
             currentTouch: withoutAuth(contactSession),
             previousDifferentTouch: withoutAuth(previousDifferentTouch),
             responsibleTouch: withoutAuth(responsibleTouch),
+            weakCandidate: withoutAuth(weakCandidate),
+            assistBoundaries: Object.fromEntries(lastOpponentContactSequenceByTeam),
             latestTouchByTeam: Object.fromEntries([...latestTouchByTeam].map(([team, touch]) => [team, withoutAuth(touch)])),
             contactSession: withoutAuth(contactSession),
             lastObservation: lastObservation ? { ...lastObservation,
