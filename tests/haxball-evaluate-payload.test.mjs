@@ -31,11 +31,13 @@ const initializationSource = source.slice(
     source.indexOf('export async function start('),
 ).replaceAll('import.meta.url', JSON.stringify(new URL('../haxball.mjs', import.meta.url).href));
 
-function initializeWith(page, readStadium = readFile, window = {}) {
+function initializeWith(page, readStadium = readFile, window = {}, dateNow = Date.now) {
+    const ClockDate = class extends Date { static now() { return dateNow(); } };
     const context = vm.createContext({
         state: { page },
         updateState() {},
         console,
+        Date: ClockDate,
         URL,
         setTimeout,
         clearTimeout,
@@ -50,6 +52,40 @@ function initializeWith(page, readStadium = readFile, window = {}) {
         window,
     });
     return vm.runInContext(`${initializationSource}\ninitializeRoom('test-token')`, context);
+}
+
+async function createGoalAttributionRoom() {
+    let now = 1000;
+    const players = [
+        { id: 1, name: 'Attacker', team: 1, auth: 'private-auth-a' },
+        { id: 4, name: 'Defender', team: 2, auth: 'private-auth-d' },
+        { id: 5, name: 'Defender 2', team: 2, auth: 'private-auth-e' },
+    ];
+    const discs = new Map(players.map(player => [player.id, { x: 100, y: 100, xspeed: 0, yspeed: 0, radius: 15 }]));
+    const ball = { x: 0, y: 0, xspeed: 0, yspeed: 0, radius: 10 };
+    const goals = [], reports = [];
+    const room = {
+        setCustomStadium() {}, setScoreLimit() {}, setTimeLimit() {},
+        sendAnnouncement() {}, setPlayerAdmin() {}, getPlayerList() { return players; },
+        getScores() { return { red: 0, blue: 0, time: (now - 1000) / 1000 }; },
+        getBallPosition() { return { x: ball.x, y: ball.y }; },
+        getDiscProperties() { return ball; },
+        getPlayerDiscProperties(id) { return discs.get(id) ?? null; },
+    };
+    const window = {
+        HBInit: () => room,
+        saveDiagnosticReport(report) { reports.push(report); return reports.length; },
+        statsOnTeamGoal(team, scorer, assister) { goals.push({ team, scorer, assister }); },
+    };
+    await initializeWith({ async exposeFunction() {}, async evaluate(fn, payload) { fn(payload); } }, readFile, window, () => now);
+    for (const player of players) room.onPlayerJoin(player);
+    room.onGameStart(null);
+    return {
+        room, players, goals, reports,
+        setTime(value) { now = value; },
+        setBall({ x = 0, y = 0, xspeed = 0, yspeed = 0 } = {}) { Object.assign(ball, { x, y, xspeed, yspeed }); },
+        setDisc(id, { x, y, xspeed = 0, yspeed = 0 } = {}) { Object.assign(discs.get(id), { x, y, xspeed, yspeed }); },
+    };
 }
 
 test('all ten bundled built-in stadiums load and match their HaxBall source blobs', async () => {
@@ -234,4 +270,139 @@ test('diagnostics are private, rate limited, and autosave the state before reset
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(announcements.at(-1).target, 2);
     assert.match(announcements.at(-1).message, /Nie udało/);
+});
+
+test('room callbacks separate tick contacts, discard kick-interval impulses, and preserve decision diagnostics', async () => {
+    const harness = await createGoalAttributionRoom();
+    const [attacker, defender] = harness.players;
+
+    // Establish the pre-kick physics endpoint with no contact.
+    harness.setTime(1000);
+    harness.room.onGameTick();
+    harness.setTime(1008);
+    harness.room.onPlayerBallKick(attacker);
+    harness.setDisc(defender.id, { x: 12, y: 0 });
+    harness.setBall({ xspeed: 5, yspeed: 0 });
+    harness.setTime(1016);
+    harness.room.onGameTick();
+    harness.setTime(1100);
+    harness.room.onTeamGoal(1);
+
+    assert.equal(harness.goals.length, 1);
+    assert.equal(harness.goals[0].scorer.name, 'Attacker');
+    assert.equal(harness.goals[0].assister, null);
+    assert.equal(harness.goals[0].scorer.auth, 'private-auth-a');
+
+    // Goal history must retain the pre-reset candidate/evidence, while the
+    // subsequent manual report remains private and contains no auth values.
+    assert.equal(harness.room.onPlayerChat(attacker, '!save post-goal'), false);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(harness.reports.length, 1);
+    const report = harness.reports[0];
+    const decision = report.attributionDecisions.at(-1).attribution;
+    assert.equal(decision.scorer.name, 'Attacker');
+    assert.equal(decision.candidateReason, 'explicit-kick');
+    assert.equal(decision.evidence.reason, 'velocity-ignored-kick-in-sampling-interval');
+    assert.equal(report.context.algorithm.responsibleTouch, null, 'current state was cleared after goal');
+    assert.doesNotMatch(JSON.stringify(report), /private-auth|playerAuth|"auth"/);
+});
+
+test('a later independent redirected-contact interval is not hidden by a kick cooldown', async () => {
+    const harness = await createGoalAttributionRoom();
+    const [attacker, defender] = harness.players;
+    harness.setTime(1000);
+    harness.room.onGameTick();
+    harness.setTime(1008);
+    harness.room.onPlayerBallKick(attacker);
+    harness.setDisc(defender.id, { x: 12, y: 0 });
+    harness.setBall({ xspeed: 5, yspeed: 0 });
+    harness.setTime(1016);
+    harness.room.onGameTick(); // Kick interval is rejected.
+    harness.setDisc(defender.id, { x: 10, y: 1 });
+    harness.setBall({ xspeed: -3, yspeed: 4 });
+    harness.setTime(1032);
+    harness.room.onGameTick(); // New continuous interval supports a redirect.
+    harness.setTime(1040);
+    harness.room.onTeamGoal(1);
+
+    assert.equal(harness.goals[0].scorer.name, 'Defender');
+    assert.equal(harness.goals[0].scorer.team, 2);
+});
+
+test('room tick callbacks end a proximity session at a no-contact sample without losing the scorer', async () => {
+    const harness = await createGoalAttributionRoom();
+    const [attacker, defender] = harness.players;
+    harness.setTime(1000);
+    harness.room.onGameTick();
+    harness.setTime(1008);
+    harness.room.onPlayerBallKick(attacker);
+    harness.setDisc(defender.id, { x: 12, y: 0 });
+    harness.setTime(1016);
+    harness.room.onGameTick();
+    harness.setDisc(defender.id, { x: 100, y: 100 });
+    harness.setTime(1032);
+    harness.room.onGameTick(); // Explicit no-contact tick closes the first session.
+    harness.setDisc(defender.id, { x: 12, y: 0 });
+    harness.setTime(5000);
+    harness.room.onGameTick(); // A later brief contact starts a new session.
+    harness.setTime(5100);
+    harness.room.onTeamGoal(1);
+
+    assert.equal(harness.goals[0].scorer.name, 'Attacker');
+    assert.equal(harness.goals[0].scorer.team, 1);
+    assert.equal(harness.room.onPlayerChat(attacker, '!save after-gap'), false);
+    await new Promise(resolve => setImmediate(resolve));
+    const decision = harness.reports.at(-1).attributionDecisions.at(-1).attribution;
+    assert.equal(decision.candidateReason, 'explicit-kick');
+    assert.equal(harness.reports.at(-1).context.algorithm.responsibleTouch, null);
+});
+
+test('pause and unpause callbacks invalidate physics continuity without clearing responsibility', async () => {
+    const harness = await createGoalAttributionRoom();
+    const [attacker, defender] = harness.players;
+    harness.setTime(1000);
+    harness.room.onGameTick();
+    harness.setTime(1008);
+    harness.room.onPlayerBallKick(attacker);
+    harness.setDisc(defender.id, { x: 12, y: 0 });
+    harness.setBall({ xspeed: 5, yspeed: 0 });
+    harness.setTime(1016);
+    harness.room.onGameTick();
+    harness.room.onGamePause();
+    harness.room.onGameUnpause();
+    harness.setDisc(defender.id, { x: 10, y: 1 });
+    harness.setBall({ xspeed: -3, yspeed: 4 });
+    harness.setTime(1032);
+    harness.room.onGameTick();
+    harness.setTime(1040);
+    harness.room.onTeamGoal(1);
+
+    assert.equal(harness.goals[0].scorer.name, 'Attacker');
+    assert.equal(harness.reports.length, 0);
+    assert.equal(harness.room.onPlayerChat(attacker, '!save pause-boundary'), false);
+    await new Promise(resolve => setImmediate(resolve));
+    const report = harness.reports[0];
+    const decision = report.attributionDecisions.at(-1).attribution;
+    assert.equal(decision.candidateEvidence.reason, 'explicit-kick');
+    assert.ok(report.events.some(event => event.type === 'gamePause'));
+    assert.ok(report.events.some(event => event.type === 'gameUnpause'));
+});
+
+test('multiple room contacts make physical attribution ambiguous instead of transferring on proximity alone', async () => {
+    const harness = await createGoalAttributionRoom();
+    const [attacker, defender, defender2] = harness.players;
+    harness.setTime(1000);
+    harness.room.onGameTick();
+    harness.setTime(1008);
+    harness.room.onPlayerBallKick(attacker);
+    harness.setDisc(defender.id, { x: 12, y: 0 });
+    harness.setDisc(defender2.id, { x: 13, y: 0 });
+    harness.setTime(1016);
+    harness.room.onGameTick();
+    harness.setBall({ xspeed: 5, yspeed: 0 });
+    harness.setTime(1032);
+    harness.room.onGameTick();
+    harness.setTime(1040);
+    harness.room.onTeamGoal(1);
+    assert.equal(harness.goals[0].scorer.name, 'Attacker');
 });

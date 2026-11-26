@@ -173,7 +173,6 @@ async function initializeRoom(token = null) {
             playerAuthMap: {}, // Map player.id -> { auth, name } (room.getPlayerList() doesn't include auth)
             finalScores: null, // Saved from onTeamVictory, null if draw/stopped early
         };
-        let previousBallVelocity = null;
 
         competition = eval(competitionFactorySource)({
             room, randomizer: stadiumRandomizer,
@@ -194,7 +193,7 @@ async function initializeRoom(token = null) {
         }
 
         // Helper: Record an immutable ball-touch snapshot for goal attribution.
-        function recordBallTouch(player, source, position, physics = {}) {
+        function recordBallTouch(player, source, position) {
             if (!gameState.isGameRunning) return false;
             if (player.team === 0) return false; // Skip spectators
 
@@ -210,10 +209,6 @@ async function initializeRoom(token = null) {
                 matchTime: scores?.time ?? null,
                 position: ballPosition ? { x: ballPosition.x, y: ballPosition.y } : null,
                 source,
-                ballVelocity: physics.ballVelocity ?? null,
-                velocityBefore: physics.velocityBefore ?? null,
-                velocityAfter: physics.velocityAfter ?? null,
-                durationMs: physics.durationMs ?? 0,
             };
             const recorded = goalAttribution.recordTouch(touch);
             if (recorded) {
@@ -273,7 +268,6 @@ async function initializeRoom(token = null) {
             gameState.isGameRunning = true;
             competition.onGameStart();
             goalAttribution.resetMatch();
-            previousBallVelocity = null;
             gameState.matchGoals = {};
             gameState.finalScores = { red: 0, blue: 0 }; // Initialize to 0:0 for draw tracking
 
@@ -466,7 +460,6 @@ async function initializeRoom(token = null) {
 
             // Do not reset before resolving the goal; reset after so the next play starts clean.
             goalAttribution.resetPlay();
-            previousBallVelocity = null;
         };
 
         // Team victory - save final scores
@@ -512,21 +505,38 @@ async function initializeRoom(token = null) {
                 timestamp,
             });
 
+            goalAttribution.observeTick({
+                timestamp,
+                contact: contact?.player ?? null,
+                contactCandidateIds: contact?.candidateIds ?? [],
+                contactCandidateStates: contact?.candidateStates ?? [],
+                ballVelocity,
+                ballPosition,
+            });
             if (contact?.player) {
-                recordBallTouch(contact.player, 'proximity', ballPosition, {
-                    ballVelocity,
-                    velocityBefore: previousBallVelocity,
-                    velocityAfter: ballVelocity,
-                });
+                const { id, name, team } = contact.player;
+                safeDiagnostic(() => diagnostics.event({ timestamp, matchTime: room.getScores?.()?.time ?? null,
+                    type: 'contact', source: 'proximity', playerId: id, playerName: name, playerTeam: team,
+                    position: ballPosition ? { x: ballPosition.x, y: ballPosition.y } : null,
+                    candidateIds: contact.candidateIds, ballVelocity }));
             }
-            previousBallVelocity = ballVelocity;
         };
 
         // Positions reset after a goal or manual reset: start fresh for the next play.
         room.onPositionsReset = () => {
             event('positionsReset');
             goalAttribution.resetPlay();
-            previousBallVelocity = null;
+        };
+
+        // Pause boundaries invalidate physical continuity, but keep the last
+        // responsible player and assist history until the play resets.
+        room.onGamePause = () => {
+            goalAttribution.breakContinuity('game-paused');
+            event('gamePause');
+        };
+        room.onGameUnpause = () => {
+            goalAttribution.breakContinuity('game-unpaused');
+            event('gameUnpause');
         };
 
         // Player chat - handle commands
