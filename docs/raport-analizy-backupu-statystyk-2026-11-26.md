@@ -24,24 +24,25 @@ Najważniejsze ustalenie dotyczące komentarzy: trzy z czterech komentarzy ręcz
 
 Każdy mecz ma co najmniej jeden wpis gracza. Nie ma osieroconych odwołań między meczami i graczami. Raporty diagnostyczne przechowują do około 180 sekund historii przed zapisem; przez to dwa raporty mogą zawierać te same zdarzenia, a bufor może obejmować końcówkę poprzedniego meczu.
 
-## Dopasowanie raportów automatycznych do komentarzy
+## Grupowanie pojedynczych przypadków
 
-Znaczniki czasu w `created_at` są zapisane z dokładnością do sekundy. Pole `timestamp` w JSON zawiera czas UTC z dokładnością do milisekund. Raporty ręczne zapisano około 2,6–3,5 sekundy po czasie z payloadu. W kodzie automat zapisuje raport przy bramce typu `unknown`; komenda `!save <komentarz>` zapisuje ręczny zrzut aktualnego bufora. Oba raporty są więc osobnymi zrzutami, a nie jednym rekordem z dopiętym komentarzem.
+Poniższa analiza służy do wyciągnięcia wskazówek na przyszłość; nie zakłada poprawiania dawnych statystyk. W bazie raport oznacza zrzut bufora, nie pojedynczą bramkę. Ponieważ bufor zachowuje około 180 sekund historii, te same akcje pojawiają się w kilku raportach. Przypadki grupuję więc po czasie zdarzenia, wyniku i `matchTime`, a nie liczę każdego raportu jako osobnego przykładu.
 
-| Raport auto | Raport ręczny | Odstęp | Stan przy zapisie | Decyzja algorytmu i komentarz |
-|---|---|---:|---|---|
-| #2, 09:17:11 | #3, 09:17:18 — `samoboj wojtek` | 7 s | 1–0, 24,90 s; stan identyczny | Bieżąca bramka `unknown`, niska pewność, `no-recent-scoring-touch`. Komentarz najpewniej opisuje tę nierozpoznaną bramkę jako samobój Wojtka. |
-| #2, 09:17:11 | #4, 09:19:14 — `samoboj airfryer` | 123 s | 3–1, 116,45 s | To późniejsza bramka w tym samym meczu, nie ta sama sytuacja co w #2. Przy wyniku 3–1 algorytm przypisał bramkę Wojtkowi ze średnią pewnością (`opponent-proximity-deflection`, `isOwnGoal=false`); komentarz wskazuje na samobój AirFryera. |
-| #5, 09:26:13 | #6, 09:26:24 — `brazylia gol` | 11 s | 1–2, 29,55 → 30,60 s | Bieżąca bramka `unknown`, niska pewność, `no-recent-scoring-touch`. Komentarz wskazuje Brazylię jako strzelca. |
-| #7, 09:27:57 | #8, 09:28:06 — `gol airfryer` | 9 s | 4–4, 100,22 s; stan identyczny | Bieżąca bramka `unknown`, niska pewność, `no-recent-scoring-touch`. Komentarz wskazuje AirFryera jako strzelca. |
+| Przypadek | Raporty zawierające akcję | Zapis i wynik automatu | Grupa do przyszłej analizy |
+|---|---|---|---|
+| Mecz 343, 1–0 przy 24,90 s | #2 auto i #3 ręczny; 7 s różnicy, ten sam wynik i czas gry | `unknown`, niska pewność, `no-recent-scoring-touch`; komentarz #3: `samoboj wojtek` | Oznaczony komentarzem. Kandydat na samobój Wojtka, do weryfikacji na podstawie kontaktów i pozycji z logu. Liczyć jako jeden przypadek. |
+| Mecz 343, 3–1 przy 115,33 s | #4 ręczny | Automat przypisał bramkę Wojtkowi ze średnią pewnością (`opponent-proximity-deflection`, `isOwnGoal=false`); komentarz: `samoboj airfryer` | Oznaczony komentarzem. Przypadek możliwego błędnego przypisania lub samobója przy odbiciu. To osobna bramka od wyniku 1–0. |
+| Mecz 345, 1–2 przy 29,55–30,60 s | #5 auto i #6 ręczny; akcja jest też w buforze #7–#8 | `unknown`, niska pewność, `no-recent-scoring-touch`; komentarz #6: `brazylia gol` | Oznaczony komentarzem. Kandydat na bramkę Brazylii. Raporty #7–#8 powtarzają tę samą akcję w historii bufora — nie liczyć jej drugi raz. |
+| Mecz 345, 4–4 przy 100,22 s | #7 auto i #8 ręczny; 9 s różnicy, ten sam wynik i czas gry | `unknown`, niska pewność, `no-recent-scoring-touch`; komentarz #8: `gol airfryer` | Oznaczony komentarzem. Kandydat na bramkę AirFryera. |
+| Mecz 341, 0–1 przy 12,27 s | #1 auto, brak komentarza | `unknown`, niska pewność | Nierozstrzygnięty przykład bez etykiety. Może służyć do badania, kiedy automat traci przypisanie, ale nie do ustalania strzelca. |
 
-Raport #1 (09:09:07; wynik 0–1 przy 12,27 s) jest automatyczny i nie ma odpowiadającego mu komentarza w tej kopii. Zawiera nierozpoznaną bramkę z niską pewnością.
+W tej kopii są zatem cztery różne automatyczne przypadki `unknown`: trzy z komentarzem i jeden bez. Jest też jeden osobny, ręcznie skomentowany przypadek średnio pewnego przypisania. Komentarze są wskazówkami użytkownika, nie niezależnie potwierdzoną prawdą. Do analizy tego, kto strzelił, należy używać ich jako kandydatów do weryfikacji; automaty bez komentarza pozostawić jako nierozstrzygnięte. Raporty automatyczne sparowane z ręcznymi dostarczają kontekstu dla tej samej akcji, a nie dodatkowych przypadków.
+
+Warto rozróżnić komentarz `samoboj wojtek`: w buforach #2–#3 zachowała się także wcześniejsza bramka 1–1 z poprzedniego meczu, już przypisana jako samobój Wojtka z wysoką pewnością. Komentarz powstał jednak przy bieżącym wyniku 1–0, którego decyzja była `unknown`; najpewniej opisuje więc właśnie bramkę 1–0. Czas Unix zdarzenia pozwala oddzielić te dwie akcje mimo wspólnego bufora.
 
 ### Mecze odpowiadające zapisom
 
-Porównanie czasu raportu z przedziałem meczu wyliczonym jako `timestamp - duration` wskazuje, że raporty #2–#4 powstały podczas meczu z rekordem `matches.id=343` (końcowy wynik 5–2), a raporty #5–#8 podczas meczu `matches.id=345` (końcowy wynik 4–7). Raport #1 przypada na mecz `matches.id=341` (2–1). To dopasowanie czasowe; schemat nie zapisuje identyfikatora meczu w raporcie diagnostycznym.
-
-Komentarz `samoboj wojtek` wymaga szczególnej ostrożności przy odczycie: w buforze raportów #2–#3 jest też wcześniejsza bramka 1–1 z poprzedniego meczu, którą algorytm już oznaczył jako samobój Wojtka z wysoką pewnością. Komentarz ręczny powstał jednak przy aktualnym wyniku 1–0, którego bieżąca decyzja była `unknown`. Dopasowanie komentarza dotyczy więc najpewniej bramki 1–0, a wcześniejsza decyzja 1–1 to osobne zdarzenie zachowane w tym samym buforze.
+Porównanie czasu raportu z przedziałem meczu wyliczonym jako `timestamp - duration` wskazuje, że przypadki #2–#3 i #4 pochodzą z meczu `matches.id=343` (końcowy wynik 5–2), przypadki #5–#8 z meczu `matches.id=345` (4–7), a #1 z meczu `matches.id=341` (2–1). To dopasowanie czasowe; schemat nie zapisuje identyfikatora meczu w raporcie diagnostycznym.
 
 ## Statystyki graczy
 
@@ -65,6 +66,8 @@ Profil `Air Fryer` (4 mecze) jest osobny od `AirFryer` (257 meczów). To możliw
 
 ## Wnioski
 
-Komentarze są użytecznymi etykietami do oceny atrybucji: trzy wskazują prawdopodobny strzelec przy bramce oznaczonej jako nierozpoznana, a jeden kwestionuje średnio pewne przypisanie Wojtkowi. Największą luką w danych meczowych jest brak osobnego zapisu samobójów i nierozpoznanych bramek per mecz. Przy dalszej analizie warto traktować komentarze jako wskazówki do ręcznej weryfikacji, a nie jako automatycznie potwierdzone korekty statystyk.
+Te zapisy nie uzasadniają korygowania dawnych statystyk. Do poprawy działania na przyszłość warto prowadzić dwie grupy: (1) przypadki z komentarzem jako ręczne hipotezy do sprawdzenia w śladzie kontaktów, (2) automatyczne `unknown` bez komentarza jako nierozstrzygnięte przykłady bez etykiety strzelca. W tej kopii pierwsza grupa ma cztery przypadki komentarzy, druga — jeden unikatowy automatyczny przypadek bez komentarza. Zrzuty sparowane czasem z komentarzem należy łączyć w jeden przypadek bramki.
+
+Najbardziej powtarzalny sygnał do przyszłej analizy to `no-recent-scoring-touch`: trzy skomentowane bramki miały tę decyzję i niską pewność. Czwarty komentarz wskazuje osobny typ problemu — możliwy samobój lub odbicie przy średnio pewnym przypisaniu przeciwnikowi. Największą luką w danych meczowych jest brak osobnego zapisu samobojów i nierozpoznanych bramek per mecz. Komentarze pozostają wskazówkami do ręcznej weryfikacji, a nie potwierdzonymi korektami statystyk.
 
 **Źródła interpretacji kodu:** [`docs/diagnostics.md`](diagnostics.md), [`stats/tracker.mjs`](../stats/tracker.mjs), [`stats/database.mjs`](../stats/database.mjs), [`stats/goal-attribution.mjs`](../stats/goal-attribution.mjs), [`STATS_SPEC.md`](../STATS_SPEC.md).
