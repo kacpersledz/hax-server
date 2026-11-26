@@ -164,7 +164,6 @@ async function initializeRoom(token = null) {
         // Stats tracking state
         const goalAttribution = createGoalAttributionEngine({
             assistTimeWindowMs: 3000,
-            maxGoalTouchAgeMs: 3000,
             diagnostics: config.goalAttributionDiagnostics === true,
         });
 
@@ -174,6 +173,7 @@ async function initializeRoom(token = null) {
             playerAuthMap: {}, // Map player.id -> { auth, name } (room.getPlayerList() doesn't include auth)
             finalScores: null, // Saved from onTeamVictory, null if draw/stopped early
         };
+        let previousBallVelocity = null;
 
         competition = eval(competitionFactorySource)({
             room, randomizer: stadiumRandomizer,
@@ -194,7 +194,7 @@ async function initializeRoom(token = null) {
         }
 
         // Helper: Record an immutable ball-touch snapshot for goal attribution.
-        function recordBallTouch(player, source, position) {
+        function recordBallTouch(player, source, position, physics = {}) {
             if (!gameState.isGameRunning) return false;
             if (player.team === 0) return false; // Skip spectators
 
@@ -210,6 +210,10 @@ async function initializeRoom(token = null) {
                 matchTime: scores?.time ?? null,
                 position: ballPosition ? { x: ballPosition.x, y: ballPosition.y } : null,
                 source,
+                ballVelocity: physics.ballVelocity ?? null,
+                velocityBefore: physics.velocityBefore ?? null,
+                velocityAfter: physics.velocityAfter ?? null,
+                durationMs: physics.durationMs ?? 0,
             };
             const recorded = goalAttribution.recordTouch(touch);
             if (recorded) {
@@ -269,6 +273,7 @@ async function initializeRoom(token = null) {
             gameState.isGameRunning = true;
             competition.onGameStart();
             goalAttribution.resetMatch();
+            previousBallVelocity = null;
             gameState.matchGoals = {};
             gameState.finalScores = { red: 0, blue: 0 }; // Initialize to 0:0 for draw tracking
 
@@ -461,6 +466,7 @@ async function initializeRoom(token = null) {
 
             // Do not reset before resolving the goal; reset after so the next play starts clean.
             goalAttribution.resetPlay();
+            previousBallVelocity = null;
         };
 
         // Team victory - save final scores
@@ -481,6 +487,8 @@ async function initializeRoom(token = null) {
 
             const ballPosition = room.getBallPosition();
             const ballDisc = room.getDiscProperties(0);
+            const ballVelocity = ballDisc && Number.isFinite(ballDisc.xspeed) && Number.isFinite(ballDisc.yspeed)
+                ? { x: ballDisc.xspeed, y: ballDisc.yspeed } : null;
             const ballRadius = ballDisc?.radius;
             const timestamp = Date.now();
             const players = room.getPlayerList()
@@ -505,14 +513,20 @@ async function initializeRoom(token = null) {
             });
 
             if (contact?.player) {
-                recordBallTouch(contact.player, 'proximity', ballPosition);
+                recordBallTouch(contact.player, 'proximity', ballPosition, {
+                    ballVelocity,
+                    velocityBefore: previousBallVelocity,
+                    velocityAfter: ballVelocity,
+                });
             }
+            previousBallVelocity = ballVelocity;
         };
 
         // Positions reset after a goal or manual reset: start fresh for the next play.
         room.onPositionsReset = () => {
             event('positionsReset');
             goalAttribution.resetPlay();
+            previousBallVelocity = null;
         };
 
         // Player chat - handle commands
