@@ -562,6 +562,152 @@ test('multiple nearby players make a velocity impulse ambiguous', () => {
     assert.equal(result.evidence.reason, 'ambiguous-multiple-contact-candidates');
 });
 
+test('ambiguous contact restarts the physical session instead of poisoning later unique ticks', () => {
+    const e = engine();
+    submit(e, touch(P.A, 1000, 'kick'));
+    tick(e, 1100, P.D, { x: 1, y: 0 }, [P.D.playerId, 5]);
+    assert.equal(e.getDebugState().contactSession, null);
+
+    for (let i = 0; i < 42; i++) tick(e, 1117 + i * 17, P.D, { x: 1, y: 0 });
+    const result = e.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.type, 'own_goal');
+    assert.equal(result.scorer.name, 'D');
+    assert.equal(result.confidence, 'medium');
+    assert.equal(result.candidateReason, 'sustained-contact');
+    assert.equal(result.candidateEvidence.sessionRestartedAfterAmbiguity, true);
+});
+
+test('ambiguous ticks split sustained contact and do not create fallback or assist boundaries', () => {
+    const split = engine();
+    submit(split, touch(P.A, 1000, 'kick'));
+    let timestamp = 1016;
+    for (let i = 0; i <= 12; i++, timestamp += 17) tick(split, timestamp, P.D);
+    assert.equal(split.getDebugState().contactSession.durationMs, 200);
+    tick(split, timestamp, P.D, null, [P.D.playerId, 5]);
+    timestamp += 17;
+    for (let i = 0; i < 12; i++, timestamp += 17) tick(split, timestamp, P.D);
+    assert.equal(split.getDebugState().responsibleTouch.playerId, P.A.playerId,
+        '200 ms before and after ambiguity are not accumulated');
+    for (let i = 0; i < 7; i++, timestamp += 17) tick(split, timestamp, P.D);
+    assert.equal(split.getDebugState().responsibleTouch.playerId, P.D.playerId,
+        'the new session may take over after its own 300 ms');
+
+    const ambiguousOnly = engine();
+    for (let i = 0; i < 30; i++) tick(ambiguousOnly, 1000 + i * 17, P.D, null, [P.D.playerId, 5]);
+    assert.equal(ambiguousOnly.getDebugState().weakCandidate, null);
+    assert.equal(ambiguousOnly.getDebugState().contactSession, null);
+    assert.equal(ambiguousOnly.resolveGoal({ scoringTeam: RED }).type, 'unknown');
+
+    const noSelectedCandidate = engine();
+    tick(noSelectedCandidate, 1000, null, null, [P.D.playerId, 5]);
+    assert.equal(noSelectedCandidate.getDebugState().lastEvidence.reason, 'ambiguous-multiple-contact-candidates');
+    tick(noSelectedCandidate, 1016, P.D);
+    assert.equal(noSelectedCandidate.getDebugState().lastEvidence.sessionRestartedAfterAmbiguity, true);
+
+    const assistBoundary = engine();
+    submit(assistBoundary, touch(P.A, 1000));
+    submit(assistBoundary, touch(P.B, 1100));
+    tick(assistBoundary, 1200, P.D, null, [P.D.playerId, 5]);
+    const result = assistBoundary.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.scorer.name, 'B');
+    assert.equal(result.assister.name, 'A');
+});
+
+test('ambiguous observations reject adjacent physics intervals but allow the next independent redirect', () => {
+    const e = engine();
+    submit(e, touch(P.A, 900, 'kick'));
+    tick(e, 1000, P.D, { x: 0.5, y: 0 }, [P.D.playerId], { x: 0, y: 0 });
+    tick(e, 1016, P.D, { x: -3, y: 0 }, [P.D.playerId, 5], { x: -2, y: 0 });
+    tick(e, 1032, P.D, { x: -3, y: 0 }, [P.D.playerId], { x: 0, y: 0 });
+    assert.equal(e.getDebugState().responsibleTouch.playerId, P.A.playerId,
+        'the ambiguous-to-unique interval cannot transfer responsibility');
+    assert.equal(e.getDebugState().lastEvidence.sessionRestartedAfterAmbiguity, true);
+    tick(e, 1048, P.D, { x: 5, y: 0 }, [P.D.playerId], { x: 2, y: 0 });
+    const result = e.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.scorer.name, 'D');
+    assert.equal(result.candidateReason, 'velocity-direction-change');
+});
+
+test('a changed team creates a new possession snapshot while preserving human identity', () => {
+    const changedOnKick = engine();
+    submit(changedOnKick, touch(P.A, 1000, 'kick'));
+    submit(changedOnKick, touch({ ...P.A, playerTeam: BLUE, playerName: 'A-blue' }, 1200, 'kick'));
+    let result = changedOnKick.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.type, 'own_goal');
+    assert.equal(result.scorer.name, 'A-blue');
+    assert.equal(result.scorer.team, BLUE);
+    assert.equal(result.scorer.auth, P.A.playerAuth);
+    assert.equal(result.responsibilityTimestamp, 1200);
+    assert.equal(result.assister, null);
+
+    const blueGoal = engine();
+    submit(blueGoal, touch(P.A, 1000, 'kick'));
+    submit(blueGoal, touch({ ...P.A, playerTeam: BLUE }, 1200, 'kick'));
+    result = blueGoal.resolveGoal({ scoringTeam: BLUE });
+    assert.equal(result.type, 'goal');
+    assert.equal(result.scorer.team, BLUE);
+    assert.equal(result.assister, null, 'the same human cannot assist themself across a team change');
+
+    const noNewContact = engine();
+    submit(noNewContact, touch(P.A, 1000, 'kick'));
+    result = noNewContact.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.type, 'goal');
+    assert.equal(result.scorer.team, RED, 'a team-change callback alone must not rewrite the historical owner');
+
+    const weakChangedTeam = engine();
+    submit(weakChangedTeam, touch(P.A, 1000, 'kick'));
+    tick(weakChangedTeam, 1100, { ...P.A, playerTeam: BLUE });
+    result = weakChangedTeam.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.type, 'goal');
+    assert.equal(result.scorer.team, RED, 'a weak contact after a team change cannot replace the owner');
+
+    const proximityChangedTeam = engine();
+    submit(proximityChangedTeam, touch(P.A, 1000, 'kick'));
+    tick(proximityChangedTeam, 1016, P.A);
+    assert.equal(proximityChangedTeam.breakPlayerContinuity(P.A.playerId, 'player-team-change'), true);
+    assert.equal(proximityChangedTeam.getDebugState().responsibleTouch.playerTeam, RED);
+    assert.equal(proximityChangedTeam.getDebugState().contactSession, null);
+    let timestamp = 1032;
+    for (let i = 0; i < 20; i++, timestamp += 17) {
+        tick(proximityChangedTeam, timestamp, { ...P.A, playerTeam: BLUE });
+        if (i === 17) assert.equal(proximityChangedTeam.getDebugState().responsibleTouch.playerTeam, RED,
+            'sub-threshold new-team contact does not take over');
+    }
+    result = proximityChangedTeam.resolveGoal({ scoringTeam: RED });
+    assert.equal(result.type, 'own_goal');
+    assert.equal(result.scorer.id, P.A.playerId);
+    assert.equal(result.scorer.team, BLUE);
+    assert.equal(result.scorer.auth, P.A.playerAuth);
+    assert.equal(result.candidateReason, 'sustained-contact');
+
+    const spectatorRoundTrip = engine();
+    submit(spectatorRoundTrip, touch(P.A, 1000, 'kick'));
+    for (let i = 0; i < 12; i++) tick(spectatorRoundTrip, 1016 + i * 17, P.A);
+    assert.equal(spectatorRoundTrip.getDebugState().contactSession.durationMs, 11 * (1000 / 60));
+    assert.equal(spectatorRoundTrip.breakPlayerContinuity(P.A.playerId, 'player-became-spectator'), true);
+    assert.equal(spectatorRoundTrip.breakPlayerContinuity(P.A.playerId, 'player-returned-to-team'), false);
+    for (let i = 0; i < 12; i++) tick(spectatorRoundTrip, 1216 + i * 17, P.A);
+    assert.equal(spectatorRoundTrip.getDebugState().contactSession.durationMs, 11 * (1000 / 60),
+        'a spectator round-trip resets contact time even when the player returns to the same team');
+});
+
+test('team-change continuity invalidation is player-specific and keeps unresolved kick guards', () => {
+    const e = engine();
+    tick(e, 1000, P.A, { x: 5, y: 0 }, [P.A.playerId], { x: 0, y: 0 });
+    submit(e, touch(P.A, 1008, 'kick'));
+    assert.equal(e.breakPlayerContinuity(P.A.playerId, 'player-team-change'), true);
+    assert.deepEqual(e.getDebugState().pendingKickPlayerIds, [P.A.playerId]);
+    tick(e, 1016, P.A, { x: -5, y: 0 }, [P.A.playerId], { x: -2, y: 0 });
+    assert.equal(e.getDebugState().responsibleTouch.playerId, P.A.playerId);
+    assert.equal(e.getDebugState().lastEvidence.reason, 'velocity-ignored-kick-in-sampling-interval');
+
+    const unrelated = engine();
+    tick(unrelated, 1000, P.A, null);
+    assert.equal(unrelated.breakPlayerContinuity(P.D.playerId, 'unrelated-team-change'), false);
+    tick(unrelated, 1016, P.A, null);
+    assert.equal(unrelated.getDebugState().contactSession.durationMs, 1000 / 60);
+});
+
 test('a non-contact nearby player cannot inherit an impulse from a ball-boundary bounce', () => {
     const e = engine();
     submit(e, touch(P.A, 1000, 'kick'));

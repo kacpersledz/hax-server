@@ -181,6 +181,7 @@ async function initializeRoom(token = null) {
         });
         room.onPlayerTeamChange = (player, byPlayer) => {
             event('playerTeamChange', { player: playerInfo(player), byPlayer: playerInfo(byPlayer) });
+            goalAttribution.breakPlayerContinuity(player.id, 'player-team-change');
             competition.onPlayerTeamChange(player, byPlayer);
         };
 
@@ -433,7 +434,7 @@ async function initializeRoom(token = null) {
                 const decision = { ...attribution, scorer: cleanPlayer(scorer), assister: cleanPlayer(assister) };
                 diagnostics.event({ type: 'teamGoal', timestamp, matchTime: scores?.time ?? null, team, scores });
                 diagnostics.decision({ timestamp, matchTime: scores?.time ?? null, team, scores, attribution: decision });
-                if (attribution.type === 'unknown') {
+                if (attribution.type === 'unknown' || attribution.confidence === 'low') {
                     const report = diagnostics.report({ trigger: 'auto', timestamp, context: { ...context(), scoringTeam: team, reason: attribution.reason } });
                     sendReport(report).catch(error => console.error('[Diagnostics] Autosave failed:', error));
                 }

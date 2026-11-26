@@ -88,8 +88,13 @@ async function createGoalAttributionRoom() {
     for (const player of joinedPlayers) room.onPlayerJoin(player);
     room.onGameStart(null);
     return {
-        room, players, goals, reports,
+        room, players, goals, reports, joinedPlayers,
         setTime(value) { now = value; },
+        changeTeam(id, team) {
+            const player = players.find(candidate => candidate.id === id);
+            player.team = team;
+            room.onPlayerTeamChange(player, null);
+        },
         setBall({ x = 0, y = 0, xspeed = 0, yspeed = 0 } = {}) { Object.assign(ball, { x, y, xspeed, yspeed }); },
         setDisc(id, { x, y, xspeed = 0, yspeed = 0 } = {}) { Object.assign(discs.get(id), { x, y, xspeed, yspeed }); },
     };
@@ -244,7 +249,10 @@ test('diagnostics are private, rate limited, and autosave the state before reset
         getPlayerDiscProperties() { return { x: contactPresent ? 0 : 100, y: 100, radius: 15, xspeed: 0, yspeed: 0 }; },
     };
     let fail = false;
-    const window = { HBInit: () => room, saveDiagnosticReport(report) {
+    const goalCallbacks = [];
+    const window = { HBInit: () => room, statsOnTeamGoal(team, scorer, assister) {
+        goalCallbacks.push({ team, scorer, assister });
+    }, saveDiagnosticReport(report) {
         if (fail) throw new Error('disk failure');
         reports.push(report); return reports.length;
     } };
@@ -279,6 +287,11 @@ test('diagnostics are private, rate limited, and autosave the state before reset
     await new Promise(resolve => setImmediate(resolve));
     assert.equal(announcements.at(-1).target, 2);
     assert.match(announcements.at(-1).message, /Nie udało/);
+    room.onTeamGoal(2);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(goalCallbacks.length, 2, 'an autosave error does not block the stats callback');
+    assert.equal(goalCallbacks.at(-1).scorer, null);
+    assert.equal(reports.length, 2, 'the failed autosave is not reported as persisted');
 });
 
 test('room callbacks separate tick contacts, discard kick-interval impulses, and preserve decision diagnostics', async () => {
@@ -316,6 +329,59 @@ test('room callbacks separate tick contacts, discard kick-interval impulses, and
     assert.doesNotMatch(JSON.stringify(report), /private-auth|playerAuth|"auth"/);
 });
 
+test('team-change callbacks invalidate only physical continuity and attribution uses the qualified new-team snapshot', async () => {
+    const direct = await createGoalAttributionRoom();
+    const [attacker] = direct.players;
+    direct.setTime(1000);
+    direct.room.onPlayerBallKick(attacker);
+    direct.changeTeam(attacker.id, 2);
+    direct.setTime(1200);
+    direct.room.onPlayerBallKick(attacker);
+    direct.room.onTeamGoal(1);
+
+    assert.equal(direct.goals.length, 1);
+    assert.equal(direct.goals[0].scorer.id, attacker.id);
+    assert.equal(direct.goals[0].scorer.team, 2);
+    assert.equal(direct.goals[0].scorer.auth, direct.joinedPlayers[0].auth);
+    assert.equal(direct.goals[0].assister, null);
+    const persistedOwnGoals = [];
+    const tracker = Object.create(HaxballStatsTracker.prototype);
+    tracker.db = { updatePlayerStats(auth, stats) { persistedOwnGoals.push({ auth, stats }); } };
+    tracker.currentMatch = { playerStats: {} };
+    tracker.handleTeamGoal(1, direct.goals[0].scorer, direct.goals[0].assister);
+    assert.deepEqual(persistedOwnGoals, [{ auth: direct.joinedPlayers[0].auth, stats: { own_goals: 1 } }]);
+
+    direct.room.onPlayerChat(attacker, '!save team-change');
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(direct.reports.length, 1, 'a high-confidence own goal is not auto-saved');
+    const teamDecision = direct.reports[0].attributionDecisions.at(-1).attribution;
+    assert.equal(teamDecision.type, 'own_goal');
+    assert.equal(teamDecision.scorer.team, 2);
+    assert.doesNotMatch(JSON.stringify(direct.reports[0]), /playerAuth|"auth"/);
+
+    const historical = await createGoalAttributionRoom();
+    const [historicalAttacker] = historical.players;
+    historical.setTime(1000);
+    historical.room.onPlayerBallKick(historicalAttacker);
+    historical.changeTeam(historicalAttacker.id, 2);
+    historical.room.onTeamGoal(1);
+    assert.equal(historical.goals[0].scorer.team, 1);
+    assert.equal(historical.goals[0].scorer.id, historicalAttacker.id);
+    assert.equal(historical.goals[0].team, 1, 'the scoring team remains RED while the historical owner snapshot remains RED');
+
+    const weak = await createGoalAttributionRoom();
+    const [weakAttacker] = weak.players;
+    weak.setTime(1000);
+    weak.room.onPlayerBallKick(weakAttacker);
+    weak.changeTeam(weakAttacker.id, 2);
+    weak.setDisc(weakAttacker.id, { x: 0, y: 0 });
+    weak.setTime(1100);
+    weak.room.onGameTick();
+    weak.room.onTeamGoal(1);
+    assert.equal(weak.goals[0].scorer.team, 1,
+        'a team-change callback plus one weak sample must not rewrite historical responsibility');
+});
+
 test('proximity goals, own goals, and assists retain join auth without putting it in diagnostics', async () => {
     const harness = await createGoalAttributionRoom();
     const [attacker, defender, , teammate] = harness.players;
@@ -328,6 +394,8 @@ test('proximity goals, own goals, and assists retain join auth without putting i
         harness.room.onGameTick();
     }
     harness.room.onTeamGoal(1);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(harness.reports.length, 0, 'medium-confidence sustained contact is not auto-saved');
     assert.equal(harness.goals[0].scorer.id, attacker.id);
     assert.equal(harness.goals[0].scorer.auth, 'private-auth-a');
     assert.equal(harness.goals[0].assister, null);
@@ -338,6 +406,18 @@ test('proximity goals, own goals, and assists retain join auth without putting i
     harness.setTime(2000);
     harness.room.onGameTick();
     harness.room.onTeamGoal(1);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(harness.reports.length, 1, 'a low-confidence own goal creates exactly one auto report');
+    assert.equal(harness.reports[0].trigger, 'auto');
+    const ownGoalAutoDecision = harness.reports[0].attributionDecisions.at(-1).attribution;
+    assert.equal(ownGoalAutoDecision.type, 'own_goal');
+    assert.equal(ownGoalAutoDecision.confidence, 'low');
+    assert.equal(ownGoalAutoDecision.reason, 'fallback-weak-contact');
+    assert.equal(harness.reports[0].context.scoringTeam, 1);
+    assert.equal(harness.reports[0].context.reason, 'fallback-weak-contact');
+    assert.equal(harness.reports[0].attributionDecisions.at(-1).team, 1);
+    assert.equal(ownGoalAutoDecision.candidateEvidence.reason, 'fallback-weak-contact');
+    assert.doesNotMatch(JSON.stringify(harness.reports[0]), /playerAuth|"auth"/);
     assert.equal(harness.goals[1].scorer.id, defender.id);
     assert.equal(harness.goals[1].scorer.team, 2);
     assert.equal(harness.goals[1].scorer.auth, 'private-auth-d');
@@ -353,6 +433,8 @@ test('proximity goals, own goals, and assists retain join auth without putting i
     harness.setTime(3600);
     harness.room.onPlayerBallKick(teammate);
     harness.room.onTeamGoal(1);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(harness.reports.length, 1, 'a high-confidence kick goal adds no auto report');
     assert.equal(harness.goals[2].scorer.id, teammate.id);
     assert.equal(harness.goals[2].scorer.auth, 'private-auth-b');
     assert.equal(harness.goals[2].assister.id, attacker.id);
@@ -365,6 +447,18 @@ test('proximity goals, own goals, and assists retain join auth without putting i
     harness.setTime(4000);
     harness.room.onGameTick();
     harness.room.onTeamGoal(1);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(harness.reports.length, 2, 'a low-confidence regular fallback adds one auto report');
+    assert.equal(harness.reports[1].trigger, 'auto');
+    const regularAutoDecision = harness.reports[1].attributionDecisions.at(-1).attribution;
+    assert.equal(regularAutoDecision.type, 'goal');
+    assert.equal(regularAutoDecision.confidence, 'low');
+    assert.equal(regularAutoDecision.reason, 'fallback-weak-contact');
+    assert.equal(harness.reports[1].context.scoringTeam, 1);
+    assert.equal(harness.reports[1].context.reason, 'fallback-weak-contact');
+    assert.equal(harness.reports[1].attributionDecisions.at(-1).team, 1);
+    assert.equal(regularAutoDecision.candidateEvidence.reason, 'fallback-weak-contact');
+    assert.doesNotMatch(JSON.stringify(harness.reports[1]), /playerAuth|"auth"/);
     assert.equal(harness.goals[3].scorer.id, harness.players[4].id);
     assert.equal(harness.goals[3].scorer.auth, null, 'missing auth remains missing, not synthesized');
 
@@ -384,11 +478,12 @@ test('proximity goals, own goals, and assists retain join auth without putting i
 
     harness.room.onPlayerChat(attacker, '!save auth-privacy');
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(harness.reports.length, 1);
-    const fallbackDecision = harness.reports[0].attributionDecisions.at(-1).attribution;
+    assert.equal(harness.reports.length, 3);
+    assert.deepEqual(harness.reports.map(report => report.trigger), ['auto', 'auto', 'manual']);
+    const fallbackDecision = harness.reports[2].attributionDecisions.at(-1).attribution;
     assert.equal(fallbackDecision.reason, 'fallback-weak-contact');
     assert.equal(fallbackDecision.candidateEvidence.reason, 'fallback-weak-contact');
-    assert.doesNotMatch(JSON.stringify(harness.reports[0]), /private-auth|playerAuth|"auth"/);
+    assert.doesNotMatch(JSON.stringify(harness.reports[2]), /private-auth|playerAuth|"auth"/);
 });
 
 test('a later independent redirected-contact interval is not hidden by a kick cooldown', async () => {

@@ -30,6 +30,7 @@ export function createGoalAttributionEngine(options = {}) {
         if (config.diagnostics && typeof console !== 'undefined') console.log('[GoalAttribution]', ...args);
     };
     const samePlayer = (a, b) => !!a && !!b && a.playerId === b.playerId;
+    const sameOwner = (a, b) => samePlayer(a, b) && a.playerTeam === b.playerTeam;
     const velocity = value => value && Number.isFinite(value.x) && Number.isFinite(value.y) ? { x: value.x, y: value.y } : null;
     const publicPlayer = touch => touch ? ({ id: touch.playerId, auth: touch.playerAuth || null, name: touch.playerName, team: touch.playerTeam }) : null;
     const diagnosticPlayer = player => {
@@ -80,7 +81,7 @@ export function createGoalAttributionEngine(options = {}) {
             ? evidenceDetails.observationSequence : observationSequence;
         const acceptedEvidence = evidenceDetails || { reason, accepted: true, playerId: touch.playerId, takeoverTimestamp };
         const previous = responsibleTouch;
-        if (samePlayer(previous, touch)) {
+        if (sameOwner(previous, touch)) {
             // Keep the original takeover timestamp, but refresh the assist
             // window whenever this player makes a newly justified contact.
             previous.lastJustifiedTimestamp = justifiedTimestamp;
@@ -176,6 +177,8 @@ export function createGoalAttributionEngine(options = {}) {
             : normalizedContact ? [normalizedContact.playerId] : [];
         const unambiguousContact = !!normalizedContact && candidateIds.length === 1 &&
             candidateIds[0] === normalizedContact.playerId;
+        const ambiguousObservation = candidateIds.length > 1 ||
+            (!!normalizedContact && !unambiguousContact) || (!normalizedContact && candidateIds.length > 0);
         if (unambiguousContact) {
             noteWeakCandidate(normalizedContact, sequence, candidateIds);
             noteAssistBoundary(normalizedContact, sequence, timestamp);
@@ -186,32 +189,45 @@ export function createGoalAttributionEngine(options = {}) {
         const continuousTick = !!lastObservation && gap >= 0 && gap <= config.maxTickGapMs;
         const sameContinuousPlayer = !!contactSession && continuousTick && normalizedContact &&
             contactSession.playerId === normalizedContact.playerId &&
-            lastObservation.contactPlayerId === normalizedContact.playerId;
+            contactSession.playerTeam === normalizedContact.playerTeam &&
+            lastObservation.contactPlayerId === normalizedContact.playerId &&
+            lastObservation.contactPlayerTeam === normalizedContact.playerTeam;
         const kicksInInterval = pendingKicks;
         pendingKicks = [];
 
-        if (!normalizedContact) {
+        if (ambiguousObservation) {
+            const interruptedSession = contactSession;
+            contactSession = null;
+            lastEvidence = {
+                reason: 'ambiguous-multiple-contact-candidates', accepted: false,
+                playerId: normalizedContact?.playerId ?? null, candidateIds,
+                durationMs: 0, sessionReset: !!interruptedSession,
+                previousSessionDurationMs: interruptedSession?.durationMs ?? 0,
+                kickPlayerIds: kicksInInterval.map(kick => kick.playerId),
+            };
+        } else if (!normalizedContact) {
             contactSession = null;
             lastEvidence = {
                 reason: kicksInInterval.length ? 'no-contact-after-kick' : 'no-contact-this-tick',
                 accepted: false, gapMs: gap, kickPlayerIds: kicksInInterval.map(kick => kick.playerId),
             };
         } else {
+            const restartedAfterAmbiguity = lastObservation?.ambiguousContact === true;
             if (!sameContinuousPlayer) {
                 contactSession = {
                     ...normalizedContact,
                     startTimestamp: timestamp,
                     lastTimestamp: timestamp,
                     durationMs: 0,
-                    ambiguous: candidateIds.length !== 1 || candidateIds[0] !== normalizedContact.playerId,
+                    ambiguous: false,
                     tickCount: 1,
+                    restartedAfterAmbiguity,
                 };
             } else {
                 contactSession.lastTimestamp = timestamp;
                 contactSession.lastTouchTimestamp = timestamp;
                 contactSession.tickCount++;
                 contactSession.durationMs = (contactSession.tickCount - 1) * config.tickDurationMs;
-                contactSession.ambiguous ||= candidateIds.length !== 1 || candidateIds[0] !== normalizedContact.playerId;
             }
 
             const physicsPairValid = sameContinuousPlayer && lastObservation.ballVelocity && currentVelocity &&
@@ -227,10 +243,12 @@ export function createGoalAttributionEngine(options = {}) {
                     reason: 'velocity-ignored-kick-in-sampling-interval', accepted: false,
                     kickPlayerIds: kicksInInterval.map(kick => kick.playerId), intervalGapMs: gap,
                     contactPlayerId: normalizedContact.playerId,
+                    sessionRestartedAfterAmbiguity: contactSession.restartedAfterAmbiguity,
                 };
             } else if (contactSession.durationMs >= config.significantContactMs && !contactSession.ambiguous) {
                 const acceptedEvidence = { reason: 'sustained-contact', accepted: true, playerId: normalizedContact.playerId,
                     durationMs: contactSession.durationMs, sessionTicks: contactSession.tickCount, intervalGapMs: gap,
+                    sessionRestartedAfterAmbiguity: contactSession.restartedAfterAmbiguity,
                     lastJustifiedTimestamp: timestamp, observationSequence: sequence };
                 const evidence = contactEvidence(normalizedContact, acceptedEvidence.reason, timestamp, contactSession.durationMs);
                 assignResponsibility(evidence, contactSession.startTimestamp, acceptedEvidence.reason, 'medium', acceptedEvidence);
@@ -243,6 +261,7 @@ export function createGoalAttributionEngine(options = {}) {
                     reason: !continuousTick ? 'physics-interval-unavailable-or-gap' : 'contact-not-present-at-both-samples',
                     accepted: false, playerId: normalizedContact.playerId,
                     durationMs: contactSession.durationMs, intervalGapMs: gap,
+                    sessionRestartedAfterAmbiguity: contactSession.restartedAfterAmbiguity,
                 };
             } else {
                 const before = lastObservation.ballVelocity;
@@ -296,6 +315,8 @@ export function createGoalAttributionEngine(options = {}) {
             ballPosition: ballPosition && Number.isFinite(ballPosition.x) && Number.isFinite(ballPosition.y)
                 ? { x: ballPosition.x, y: ballPosition.y } : null,
             contactPlayerId: normalizedContact?.playerId ?? null,
+            contactPlayerTeam: normalizedContact?.playerTeam ?? null,
+            ambiguousContact: ambiguousObservation,
             tickCandidateIds: candidateIds,
             candidateStates: candidateStates.map(candidate => ({ ...candidate })),
         };
@@ -369,6 +390,22 @@ export function createGoalAttributionEngine(options = {}) {
         pendingKicks = [];
         lastEvidence = { reason, accepted: false };
     }
+    function breakPlayerContinuity(playerId, reason = 'player-continuity-broken') {
+        if (playerId == null) return false;
+        const sessionInvolvesPlayer = contactSession?.playerId === playerId;
+        const observationInvolvesPlayer = !!lastObservation && (
+            lastObservation.contactPlayerId === playerId ||
+            lastObservation.tickCandidateIds.includes(playerId) ||
+            lastObservation.candidateStates.some(candidate => candidate.id === playerId)
+        );
+        if (!sessionInvolvesPlayer && !observationInvolvesPlayer) return false;
+        contactSession = null;
+        lastObservation = null;
+        // Keep pending kicks so the next sampled interval still rejects their
+        // velocity impulse, even if the team-change callback arrives in between.
+        lastEvidence = { reason, accepted: false, playerId };
+        return true;
+    }
     function resetMatch() { resetPlay(); }
     function getTouches() {
         return [previousDifferentTouch, responsibleTouch].filter(Boolean).map(withoutAuth);
@@ -416,7 +453,8 @@ export function createGoalAttributionEngine(options = {}) {
             lastKickPlayerId, lastKickTimestamp, config: { ...config },
         };
     }
-    return { resetMatch, resetPlay, breakContinuity, recordTouch, observeTick, resolveGoal, getTouches, getDebugState, selectClosestContact, config };
+    return { resetMatch, resetPlay, breakContinuity, breakPlayerContinuity, recordTouch, observeTick,
+        resolveGoal, getTouches, getDebugState, selectClosestContact, config };
 }
 
 export class GoalAttributionEngine {
@@ -424,6 +462,7 @@ export class GoalAttributionEngine {
     resetMatch() { return this.engine.resetMatch(); }
     resetPlay() { return this.engine.resetPlay(); }
     breakContinuity(reason) { return this.engine.breakContinuity(reason); }
+    breakPlayerContinuity(playerId, reason) { return this.engine.breakPlayerContinuity(playerId, reason); }
     recordTouch(touch) { return this.engine.recordTouch(touch); }
     observeTick(input) { return this.engine.observeTick(input); }
     resolveGoal(goal) { return this.engine.resolveGoal(goal); }
