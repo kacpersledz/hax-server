@@ -164,7 +164,6 @@ async function initializeRoom(token = null) {
         // Stats tracking state
         const goalAttribution = createGoalAttributionEngine({
             assistTimeWindowMs: 3000,
-            maxGoalTouchAgeMs: 3000,
             diagnostics: config.goalAttributionDiagnostics === true,
         });
 
@@ -182,6 +181,7 @@ async function initializeRoom(token = null) {
         });
         room.onPlayerTeamChange = (player, byPlayer) => {
             event('playerTeamChange', { player: playerInfo(player), byPlayer: playerInfo(byPlayer) });
+            goalAttribution.breakPlayerContinuity(player.id, 'player-team-change');
             competition.onPlayerTeamChange(player, byPlayer);
         };
 
@@ -434,7 +434,7 @@ async function initializeRoom(token = null) {
                 const decision = { ...attribution, scorer: cleanPlayer(scorer), assister: cleanPlayer(assister) };
                 diagnostics.event({ type: 'teamGoal', timestamp, matchTime: scores?.time ?? null, team, scores });
                 diagnostics.decision({ timestamp, matchTime: scores?.time ?? null, team, scores, attribution: decision });
-                if (attribution.type === 'unknown') {
+                if (attribution.type === 'unknown' || attribution.confidence === 'low') {
                     const report = diagnostics.report({ trigger: 'auto', timestamp, context: { ...context(), scoringTeam: team, reason: attribution.reason } });
                     sendReport(report).catch(error => console.error('[Diagnostics] Autosave failed:', error));
                 }
@@ -481,6 +481,8 @@ async function initializeRoom(token = null) {
 
             const ballPosition = room.getBallPosition();
             const ballDisc = room.getDiscProperties(0);
+            const ballVelocity = ballDisc && Number.isFinite(ballDisc.xspeed) && Number.isFinite(ballDisc.yspeed)
+                ? { x: ballDisc.xspeed, y: ballDisc.yspeed } : null;
             const ballRadius = ballDisc?.radius;
             const timestamp = Date.now();
             const players = room.getPlayerList()
@@ -489,6 +491,7 @@ async function initializeRoom(token = null) {
                     const disc = room.getPlayerDiscProperties(player.id);
                     return {
                         ...player,
+                        playerAuth: gameState.playerAuthMap[player.id]?.auth ?? null,
                         disc,
                         playerRadius: disc?.radius,
                     };
@@ -504,8 +507,20 @@ async function initializeRoom(token = null) {
                 timestamp,
             });
 
+            goalAttribution.observeTick({
+                timestamp,
+                contact: contact?.player ?? null,
+                contactCandidateIds: contact?.candidateIds ?? [],
+                contactCandidateStates: contact?.candidateStates ?? [],
+                ballVelocity,
+                ballPosition,
+            });
             if (contact?.player) {
-                recordBallTouch(contact.player, 'proximity', ballPosition);
+                const { id, name, team } = contact.player;
+                safeDiagnostic(() => diagnostics.event({ timestamp, matchTime: room.getScores?.()?.time ?? null,
+                    type: 'contact', source: 'proximity', playerId: id, playerName: name, playerTeam: team,
+                    position: ballPosition ? { x: ballPosition.x, y: ballPosition.y } : null,
+                    candidateIds: contact.candidateIds, ballVelocity }));
             }
         };
 
@@ -513,6 +528,17 @@ async function initializeRoom(token = null) {
         room.onPositionsReset = () => {
             event('positionsReset');
             goalAttribution.resetPlay();
+        };
+
+        // Pause boundaries invalidate physical continuity, but keep the last
+        // responsible player and assist history until the play resets.
+        room.onGamePause = () => {
+            goalAttribution.breakContinuity('game-paused');
+            event('gamePause');
+        };
+        room.onGameUnpause = () => {
+            goalAttribution.breakContinuity('game-unpaused');
+            event('gameUnpause');
         };
 
         // Player chat - handle commands
